@@ -1,0 +1,14 @@
+#main-bar { position: sticky; top: 0; z-index: 20; }
+#edit-bar { border-bottom: 1px solid var(--border); }
+.hidden { display: none !important; }
+#workspace { display: flex; height: calc(100vh - 118px); min-height: 0; }
+#canvas-wrap { flex: 1; overflow: auto; background: var(--bg-dim); display: flex; align-items: flex-start; justify-content: center; padding: 18px; position: relative; }
+#canvas { background: #fff; box-shadow: var(--shadow); border-radius: 4px; cursor: crosshair; max-width: none; }
+#ocr-panel { width: 340px; border-left: 1px solid var(--border); background: var(--bg-elev); padding: 12px; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; }
+#ocr-text { width: 100%; min-height: 220px; resize: vertical; line-height: 1.6; }
+#statusbar { display: flex; align-items: center; gap: 12px; padding: 6px 12px; border-top: 1px solid var(--border); background: var(--bg-elev); }
+.tool-group { display: flex; gap: 2px; flex-wrap: wrap; }
+#text-input { position: absolute; font-size: 18px; padding: 4px 8px; border: 2px solid var(--accent); border-radius: 4px; }
+#menu-pop { position: fixed; z-index: 100; padding: 6px; min-width: 210px; display: flex; flex-direction: column; gap: 2px; }
+#menu-pop button { justify-content: flex-start; border: none; background: transparent; text-align: left; }
+#menu-pop button:hover { background: var(--bg-dim); }

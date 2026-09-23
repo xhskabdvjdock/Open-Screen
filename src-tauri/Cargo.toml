@@ -1,0 +1,37 @@
+[package]
+name = "open-screen"
+version = "0.1.0"
+description = "Open Screen — lightweight screenshot + editor + local OCR"
+authors = ["Open Screen"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "protocol-asset"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "fs", "process", "time", "macros", "io-util", "sync"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+xcap = "0.9"
+active-win-pos-rs = "0.11"
+arboard = "3"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["clock"] }
+uuid = { version = "1", features = ["v4"] }
+dirs = "5"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "stream"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+futures-util = "0.3"
+
+[features]
+default = []

@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Open Screen — Editor</title>
+    <link rel="stylesheet" href="./shared.css" />
+    <link rel="stylesheet" href="./editor.css" />
+  </head>
+  <body>
+    <header class="toolbar" id="main-bar">
+      <button class="btn" id="btn-copy" title="Copy to clipboard"><span class="ic"></span>Copy</button>
+      <button class="btn" id="btn-save" title="Save as…"><span class="ic"></span>Save</button>
+      <button class="btn" id="btn-copysave" title="Copy + Save"><span class="ic"></span>Copy + Save</button>
+      <span class="divider"></span>
+      <button class="btn" id="btn-ocr" title="Extract text (OCR)"><span class="ic"></span>OCR</button>
+      <button class="btn" id="btn-edit" title="Show editing tools"><span class="ic"></span>Edit</button>
+      <button class="btn" id="btn-share" title="Share…"><span class="ic"></span>Share</button>
+      <button class="btn" id="btn-more" title="More actions"><span class="ic"></span>More</button>
+      <span style="flex:1"></span>
+      <button class="icon-btn" id="btn-cancel" title="Delete / Close (Esc)"><span class="ic"></span></button>
+    </header>
+
+    <div class="toolbar hidden" id="edit-bar">
+      <div class="tool-group" id="tools"></div>
+      <span class="divider"></span>
+      <div class="row" id="colors"></div>
+      <input type="color" id="custom-color" title="Custom color" value="#e81123" />
+      <span class="divider"></span>
+      <select id="stroke" title="Stroke size">
+        <option value="2">Thin</option>
+        <option value="4" selected>Medium</option>
+        <option value="8">Thick</option>
+      </select>
+      <span class="divider"></span>
+      <button class="icon-btn" id="btn-undo" title="Undo (Ctrl+Z)"><span class="ic"></span></button>
+      <button class="icon-btn" id="btn-redo" title="Redo (Ctrl+Y)"><span class="ic"></span></button>
+      <span class="divider"></span>
+      <span class="row hidden" id="text-opts">
+        <input type="number" id="font-size" value="18" min="8" max="120" title="Font size" style="width:64px" />
+        <button class="icon-btn" id="btn-bold" title="Bold"><b>B</b></button>
+      </span>
+      <span class="row hidden" id="crop-opts">
+        <button class="btn primary" id="btn-crop-apply">Apply crop</button>
+        <button class="btn" id="btn-crop-cancel">Cancel</button>
+      </span>
+      <span class="row hidden" id="resize-opts">
+        <input type="number" id="resize-w" title="Width" style="width:76px" />
+        <span class="muted">×</span>
+        <input type="number" id="resize-h" title="Height" style="width:76px" />
+        <button class="btn primary" id="btn-resize-apply">Resize</button>
+      </span>
+    </div>
+
+    <main id="workspace">
+      <div id="canvas-wrap">
+        <canvas id="canvas"></canvas>
+        <input id="text-input" class="hidden" type="text" placeholder="Type and press Enter" />
+      </div>
+      <aside id="ocr-panel" class="hidden">
+        <div class="row" style="justify-content:space-between">
+          <h3 style="margin:0">Detected Text</h3>
+          <button class="icon-btn" id="btn-ocr-close" title="Close OCR panel"><span class="ic"></span></button>
+        </div>
+        <div class="row">
+          <label for="ocr-lang">Language</label>
+          <select id="ocr-lang">
+            <option value="auto">Auto</option>
+            <option value="eng">English</option>
+            <option value="ara">Arabic</option>
+          </select>
+          <button class="btn primary" id="btn-ocr-run">Run OCR</button>
+        </div>
+        <div id="ocr-status" class="muted">OCR runs locally, on demand.</div>
+        <textarea id="ocr-text" rows="12" placeholder="No text yet — select an area and run OCR." dir="auto"></textarea>
+        <div class="row">
+          <button class="btn" id="btn-ocr-copy">Copy Text</button>
+          <button class="btn" id="btn-ocr-save">Save Text</button>
+          <button class="btn" id="btn-ocr-copysave">Copy + Save</button>
+        </div>
+        <div id="ocr-install" class="hidden">
+          <p class="muted">Tesseract OCR engine was not found. Install once (~15MB), then OCR works fully offline.</p>
+          <div class="row">
+            <button class="btn primary" id="btn-ocr-install">Install Tesseract</button>
+          </div>
+        </div>
+        <div id="ocr-lang-dl" class="hidden">
+          <p class="muted" id="ocr-lang-msg"></p>
+          <div class="row">
+            <button class="btn" id="btn-ocr-dl">Download</button>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <footer id="statusbar">
+      <span id="st-dims" class="muted">—</span>
+      <span class="muted">·</span>
+      <span class="row"><button class="icon-btn" id="zoom-out" title="Zoom out">−</button>
+      <span id="st-zoom" class="muted">100%</span>
+      <button class="icon-btn" id="zoom-in" title="Zoom in">+</button>
+      <button class="btn" id="zoom-fit">Fit</button></span>
+      <span style="flex:1"></span>
+      <span id="st-source" class="muted"></span>
+    </footer>
+
+    <div id="menu-pop" class="hidden card"></div>
+    <script type="module" src="./editor.ts"></script>
+  </body>
+</html>

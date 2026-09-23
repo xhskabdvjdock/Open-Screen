@@ -1,0 +1,25 @@
+html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: rgba(0,0,0,.38); cursor: crosshair; user-select: none; }
+#overlay { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+.hint {
+  position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+  display: flex; gap: 12px; align-items: center;
+  background: rgba(32,33,36,.92); color: #fff; font-size: 12.5px;
+  padding: 8px 14px; border-radius: 8px; pointer-events: none; white-space: nowrap;
+  max-width: 96vw; flex-wrap: wrap; justify-content: center;
+}
+/* The mode pill is clickable — everything else in the hint ignores mouse. */
+#mode-pill { pointer-events: auto; }
+.pill { display: flex; background: rgba(255,255,255,.14); border-radius: 8px; padding: 2px; gap: 2px; }
+.pill-btn {
+  display: flex; align-items: center; gap: 6px;
+  border: none; background: transparent; color: #fff;
+  font-family: inherit; font-size: 12px; padding: 5px 12px;
+  border-radius: 6px; cursor: pointer; white-space: nowrap;
+}
+.pill-btn svg { width: 14px; height: 14px; }
+.pill-btn.active { background: #fff; color: #111; font-weight: 600; }
+.pill-btn:not(.active):hover { background: rgba(255,255,255,.18); }
+.recdot { width: 12px; height: 12px; border-radius: 50%; background: #e81123; display: inline-block; }
+.pill-btn:not(.active) .recdot { background: #ff8080; }
+.dims { background: #fff; color: #111; border-radius: 6px; padding: 2px 8px; font-variant-numeric: tabular-nums; font-weight: 600; }

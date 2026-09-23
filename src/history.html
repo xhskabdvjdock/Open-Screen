@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Open Screen — History</title>
+    <link rel="stylesheet" href="./shared.css" />
+    <style>
+      body { padding: 16px; }
+      #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; margin-top: 12px; }
+      .item { overflow: hidden; }
+      .item img { width: 100%; height: 120px; object-fit: cover; display: block; background: var(--bg-dim); }
+      .item .meta { padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; }
+      .item .actions { display: flex; gap: 4px; flex-wrap: wrap; }
+      .day { margin: 16px 0 4px; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">History</h2>
+      <span class="row"><button class="btn" id="btn-refresh">Refresh</button><button class="btn danger" id="btn-clear">Clear</button></span>
+    </div>
+    <p class="muted" id="sub">Local only. Thumbnails keep memory low — full image loads on demand.</p>
+    <div id="list"></div>
+    <div class="row" style="justify-content:space-between; margin-top:18px">
+      <h2 style="margin:0">Recordings</h2>
+      <span class="row"><button class="btn" id="btn-refresh-rec">Refresh</button></span>
+    </div>
+    <p class="muted">Metadata only — videos never load to RAM. Stored locally in your Recording folder.</p>
+    <div id="rec-list"></div>
+    <script type="module" src="./history.ts"></script>
+  </body>
+</html>

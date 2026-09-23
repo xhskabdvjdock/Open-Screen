@@ -1,0 +1,68 @@
+:root {
+  --bg: #f3f4f6;
+  --bg-elev: #ffffff;
+  --bg-dim: #e8eaed;
+  --text: #1b1d21;
+  --text-dim: #5f6368;
+  --border: #dfe1e5;
+  --accent: #0b57d0;
+  --accent-hover: #0842a0;
+  --danger: #d93025;
+  --radius: 8px;
+  --shadow: 0 1px 2px rgba(0,0,0,.08), 0 4px 16px rgba(0,0,0,.08);
+  --font: "Segoe UI", system-ui, -apple-system, Roboto, "Noto Sans Arabic", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1f1f1f;
+    --bg-elev: #2d2e30;
+    --bg-dim: #35363a;
+    --text: #e8eaed;
+    --text-dim: #9aa0a6;
+    --border: #3c4043;
+    --accent: #a8c7fa;
+    --accent-hover: #c2d7fb;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 16px rgba(0,0,0,.4);
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; font-family: var(--font); background: var(--bg); color: var(--text); font-size: 14px; }
+button { font-family: inherit; }
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--border); background: var(--bg-elev); color: var(--text);
+  border-radius: var(--radius); padding: 7px 12px; cursor: pointer; font-size: 13px;
+}
+.btn:hover { background: var(--bg-dim); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+@media (prefers-color-scheme: dark) { .btn.primary { color: #062e6f; } }
+.btn.primary:hover { background: var(--accent-hover); }
+.btn.danger { color: var(--danger); border-color: var(--danger); }
+.btn:disabled { opacity: .5; cursor: default; }
+.btn svg, .icon-btn svg { width: 16px; height: 16px; }
+.icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px; border-radius: 6px; border: 1px solid transparent;
+  background: transparent; color: var(--text); cursor: pointer;
+}
+.icon-btn:hover { background: var(--bg-dim); }
+.icon-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+@media (prefers-color-scheme: dark) { .icon-btn.active { color: #062e6f; } }
+input[type="text"], input[type="number"], select, textarea {
+  font-family: inherit; font-size: 13px; color: var(--text);
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px;
+}
+label { font-size: 13px; }
+.row { display: flex; align-items: center; gap: 8px; }
+.muted { color: var(--text-dim); font-size: 12px; }
+.card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); }
+.toolbar { display: flex; align-items: center; gap: 6px; padding: 8px 10px; background: var(--bg-elev); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.divider { width: 1px; height: 22px; background: var(--border); margin: 0 4px; }
+.toast {
+  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+  background: #323232; color: #fff; padding: 9px 16px; border-radius: 8px; font-size: 13px;
+  box-shadow: var(--shadow); z-index: 9999; opacity: 0; transition: opacity .2s;
+}
+.toast.show { opacity: 1; }
+.swatch { width: 22px; height: 22px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 0 1px var(--border); cursor: pointer; }
+.swatch.active { box-shadow: 0 0 0 2px var(--accent); }

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Select area</title>
+    <link rel="stylesheet" href="./shared.css" />
+    <link rel="stylesheet" href="./overlay.css" />
+  </head>
+  <body>
+    <canvas id="overlay"></canvas>
+    <div id="hint" class="hint">
+      <div id="mode-pill" class="pill" title="Tab to switch mode">
+        <button id="mode-image" class="pill-btn active" title="Screenshot (image)"></button>
+        <button id="mode-text" class="pill-btn" title="Text (OCR)"></button>
+        <button id="mode-record" class="pill-btn" title="Record screen"></button>
+      </div>
+      <span id="hint-text">Drag to select · F fullscreen · W window · A all screens · Esc cancel</span>
+      <span id="dims" class="dims" hidden></span>
+    </div>
+    <script type="module" src="./overlay.ts"></script>
+  </body>
+</html>
