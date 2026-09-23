@@ -1,5 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio;
+#[cfg(target_os = "windows")]
+mod wgc;
+#[cfg(target_os = "windows")]
+mod nativerec;
+#[cfg(target_os = "windows")]
+mod mfhw;
+mod mp4info;
+mod mp4mux;
 mod history;
 mod ocr;
 mod procutil;
@@ -345,9 +354,72 @@ async fn rec_probe_refresh() -> Result<recorder::Probe, String> {
     recorder::get_probe(true)
 }
 
+/// Native engine needs no download: Media Foundation + WGC + WASAPI ship
+/// with Windows. Reports the live backend summary instead.
 #[tauri::command]
-async fn ffmpeg_ensure(app: tauri::AppHandle) -> Result<String, String> {
-    recorder::ensure_ffmpeg(app).await
+fn ffmpeg_ensure() -> Result<String, String> {
+    Ok(recorder::native_engine_info())
+}
+
+#[tauri::command]
+fn audio_devices() -> audio::AudioDevices {
+    audio::list_audio_devices()
+}
+
+/// Native capture diagnostics: live WGC monitor list + a short real capture
+/// proving backend, geometry and delivery rate (used by Advanced settings).
+#[tauri::command]
+async fn native_probe() -> Result<serde_json::Value, String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Err("Windows Graphics Capture requires Windows.".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let monitors =
+            tokio::task::spawn_blocking(|| crate::wgc::list_monitors()).await.map_err(|e| e.to_string())??;
+        let stats = tokio::task::spawn_blocking(|| crate::wgc::probe_primary_monitor(2, true, None))
+            .await
+            .map_err(|e| e.to_string())??;
+        Ok(serde_json::json!({ "backend": crate::wgc::backend_name(), "monitors": monitors, "probe": stats }))
+    }
+}
+
+/// Diagnostics snapshot: system CPU + this app's CPU (the native capture +
+/// encode threads live in-process — two samples, honest numbers).
+#[tauri::command]
+async fn perf_extra() -> Result<serde_json::Value, String> {
+    let pid = std::process::id();
+    let (sys_cpu, app_cpu) = tokio::task::spawn_blocking(move || {
+        let mut sys = sysinfo::System::new_all();
+        sys.refresh_all();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        sys.refresh_all();
+        let sys_cpu = sys.global_cpu_info().cpu_usage();
+        let app_cpu = sys
+            .process(sysinfo::Pid::from(pid as usize))
+            .map(|pr| pr.cpu_usage())
+            .unwrap_or(0.0);
+        (sys_cpu, app_cpu)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "sysCpu": sys_cpu, "appCpu": app_cpu }))
+}
+
+#[tauri::command]
+async fn audio_level_test(kind: String, mic: Option<String>) -> Result<Option<f32>, String> {
+    let kind = kind.to_lowercase();
+    let mic = mic.unwrap_or_default();
+    // Blocking WASAPI probe (~1s) off the async runtime.
+    tokio::task::spawn_blocking(move || crate::audio::probe_level(&kind, &mic))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn media_info(path: String) -> Result<recorder::MediaInfo, String> {
+    Ok(recorder::verify_media(std::path::Path::new(&path)))
 }
 
 #[tauri::command]
@@ -387,10 +459,27 @@ async fn rec_start_area(
 }
 
 #[tauri::command]
+fn rec_countdown_cancel(state: tauri::State<'_, RecState>) {
+    if let Ok(r) = state.0.try_lock() {
+        r.countdown_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        // Lock held by the starter task: set via blocking lock from a
+        // short-lived thread so the cancel never deadlocks.
+        let shared = state.0.clone();
+        std::thread::spawn(move || {
+            shared.blocking_lock().countdown_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+}
+
+#[tauri::command]
 async fn rec_start_default(
     app: tauri::AppHandle,
     state: tauri::State<'_, RecState>,
 ) -> Result<recorder::RecStatus, String> {
+    if overlay_countdown(&app).await {
+        return Err("Cancelled.".to_string());
+    }
     let s = settings::load_settings();
     let area = recorder::default_source_area(&s);
     let shared = state.0.clone();
@@ -430,8 +519,9 @@ async fn replay_start(
     app: tauri::AppHandle,
     state: tauri::State<'_, RecState>,
 ) -> Result<recorder::RecStatus, String> {
-    let mut r = state.0.lock().await;
-    r.replay_start(&app).await
+    let shared = state.0.clone();
+    let mut r = shared.lock().await;
+    r.replay_start(shared.clone(), &app).await
 }
 
 #[tauri::command]
@@ -524,6 +614,69 @@ fn op_err(app: &tauri::AppHandle, e: &str) {
         .show();
 }
 
+/// On-screen countdown for hotkey/default-source starts.
+/// Shows the overlay window with a top-center 3-2-1 banner (driven by the
+/// overlay frontend), waits, then hides it and returns `true` when Esc
+/// cancelled. Capture starts only AFTER it finishes, so the countdown
+/// never appears in the final video.
+async fn overlay_countdown(app: &tauri::AppHandle) -> bool {
+    use tauri::Emitter;
+    let secs = settings::load_settings().rec_countdown;
+    let secs = match secs {
+        0 | 3 | 5 | 10 => secs,
+        _ => 3,
+    };
+    if secs == 0 {
+        return false;
+    }
+    // Arm the cancel flag, show the overlay, let the frontend count.
+    let cancel_flag = {
+        let st = app.state::<RecState>();
+        let r = st.0.lock().await;
+        r.countdown_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+        r.countdown_cancel.clone()
+    };
+    if let Some(w) = app.get_webview_window("overlay") {
+        // Size the overlay over the full virtual screen HERE (backend side,
+        // like the screenshot flow) so it appears fullscreen from the very
+        // first frame — never as a small default-sized window.
+        let _ = w.set_fullscreen(false);
+        if let Ok(mons) = screenshot::list_monitors() {
+            if !mons.is_empty() {
+                let min_x = mons.iter().map(|m| m.x).min().unwrap_or(0);
+                let min_y = mons.iter().map(|m| m.y).min().unwrap_or(0);
+                let max_x = mons.iter().map(|m| m.x + m.width as i32).max().unwrap_or(min_x + 800);
+                let max_y = mons.iter().map(|m| m.y + m.height as i32).max().unwrap_or(min_y + 600);
+                let _ = w.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
+                    x: min_x,
+                    y: min_y,
+                }));
+                let _ = w.set_size(tauri::Size::Physical(tauri::PhysicalSize {
+                    width: (max_x - min_x).max(800) as u32,
+                    height: (max_y - min_y).max(600) as u32,
+                }));
+            }
+        }
+        let _ = w.show();
+        let _ = w.set_always_on_top(true);
+        let _ = w.set_focus();
+        let _ = w.emit("openscreen:countdown", serde_json::json!({ "secs": secs }));
+    }
+    // Sleep in small slices so an Esc-cancel aborts early.
+    let steps = secs * 4;
+    for _ in 0..steps {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+    }
+    if let Some(w) = app.get_webview_window("overlay") {
+        let _ = w.emit("openscreen:countdown-hide", ());
+        let _ = w.hide();
+    }
+    cancel_flag.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Start/stop toggle (shared by tray item, Start hotkey and Stop hotkey).
 fn rec_toggle(app: &tauri::AppHandle) {
     let h = app.clone();
@@ -541,6 +694,17 @@ fn rec_toggle(app: &tauri::AppHandle) {
                 op_err(&h, &e);
             }
         } else {
+            // On-screen countdown first (not recorded), then init capture + audio.
+            if overlay_countdown(&h).await {
+                return; // Esc cancelled
+            }
+            // User may have started via picker during the wait.
+            {
+                let r = shared.lock().await;
+                if r.is_recording() || r.is_paused() {
+                    return;
+                }
+            }
             let s = settings::load_settings();
             let area = recorder::default_source_area(&s);
             let mut r = shared.lock().await;
@@ -589,7 +753,7 @@ fn replay_toggle(app: &tauri::AppHandle) {
         let res = if on {
             r.replay_stop(&h).await
         } else {
-            r.replay_start(&h).await
+            r.replay_start(shared.clone(), &h).await
         };
         if let Err(e) = res {
             drop(r);
@@ -697,121 +861,130 @@ pub(crate) fn rebuild_tray(app: &tauri::AppHandle, st: &recorder::RecStatus) {
     }
 }
 
-fn register_hotkeys(app: &tauri::AppHandle, s: &AppSettings) {
+/// Returns human-readable descriptions of hotkeys that could NOT be
+/// registered (bad format or already taken by the OS/another app).
+fn register_hotkeys(app: &tauri::AppHandle, s: &AppSettings) -> Vec<String> {
     let gs = app.global_shortcut();
     let _ = gs.unregister_all();
+    let mut failed: Vec<String> = vec![];
+    // Helper: parse + register, recording any failure with its label.
+    macro_rules! reg {
+        ($label:expr, $key:expr, $handler:expr) => {
+            match parse_hotkey($key) {
+                Some(sc) => {
+                    if gs.on_shortcut(sc, $handler).is_err() {
+                        failed.push(format!("{} ({}) is already in use by Windows or another app.", $label, $key));
+                    }
+                }
+                None => {
+                    failed.push(format!("{} ({}) has an unsupported format — use like Ctrl+Shift+S.", $label, $key));
+                }
+            }
+        };
+    }
     let app_h = app.clone();
-    if let Some(sc) = parse_hotkey(&s.screenshot_hotkey) {
-        let _ = gs.on_shortcut(sc, move |_app, _sc, event| {
+    reg!("Screenshot", &s.screenshot_hotkey, move |_app, _sc, event| {
+        if event.state == ShortcutState::Pressed {
+            start_capture(&app_h, "region");
+        }
+    });
+    if s.ocr_enabled {
+        let app_h2 = app.clone();
+        reg!("OCR", &s.ocr_hotkey, move |_app, _sc, event| {
             if event.state == ShortcutState::Pressed {
-                start_capture(&app_h, "region");
+                start_capture(&app_h2, "ocr");
             }
         });
-    }
-    let app_h2 = app.clone();
-    if s.ocr_enabled {
-        if let Some(sc) = parse_hotkey(&s.ocr_hotkey) {
-            let _ = gs.on_shortcut(sc, move |_app, _sc, event| {
-                if event.state == ShortcutState::Pressed {
-                    start_capture(&app_h2, "ocr");
-                }
-            });
-        }
     }
     // Recording hotkeys. Start/Stop (and Pause/Resume) may intentionally share
     // one key as a toggle — register shared keys only once.
     let eq = |a: &str, b: &str| a.trim().to_lowercase() == b.trim().to_lowercase();
     if eq(&s.rec_start_hotkey, &s.rec_stop_hotkey) {
-        if let Some(sc) = parse_hotkey(&s.rec_start_hotkey) {
-            let _ = gs.on_shortcut(sc, move |app, _sc, event| {
-                if event.state == ShortcutState::Pressed {
-                    rec_toggle(app);
-                }
-            });
-        }
+        reg!("Start/Stop recording", &s.rec_start_hotkey, move |app, _sc, event| {
+            if event.state == ShortcutState::Pressed {
+                rec_toggle(app);
+            }
+        });
     } else {
-        if let Some(sc) = parse_hotkey(&s.rec_start_hotkey) {
-            let _ = gs.on_shortcut(sc, move |app, _sc, event| {
-                if event.state == ShortcutState::Pressed {
-                    // Start only (never stops an active recording).
-                    let h = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let st = h.state::<RecState>();
-                        let shared = st.0.clone();
-                        let active = {
-                            let r = shared.lock().await;
-                            r.is_recording() || r.is_paused()
-                        };
-                        if active {
+        reg!("Start recording", &s.rec_start_hotkey, move |app, _sc, event| {
+            if event.state == ShortcutState::Pressed {
+                // Start only (never stops an active recording).
+                let h = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let st = h.state::<RecState>();
+                    let shared = st.0.clone();
+                    let active = {
+                        let r = shared.lock().await;
+                        r.is_recording() || r.is_paused()
+                    };
+                    if active {
+                        return;
+                    }
+                    if overlay_countdown(&h).await {
+                        return; // Esc cancelled
+                    }
+                    {
+                        let r = shared.lock().await;
+                        if r.is_recording() || r.is_paused() {
                             return;
                         }
-                        let s = settings::load_settings();
-                        let area = recorder::default_source_area(&s);
-                        let mut r = shared.lock().await;
-                        if let Err(e) = r.start_recording(shared.clone(), &h, area).await {
+                    }
+                    let s = settings::load_settings();
+                    let area = recorder::default_source_area(&s);
+                    let mut r = shared.lock().await;
+                    if let Err(e) = r.start_recording(shared.clone(), &h, area).await {
+                        drop(r);
+                        op_err(&h, &e);
+                    }
+                });
+            }
+        });
+        reg!("Stop recording", &s.rec_stop_hotkey, move |app, _sc, event| {
+            if event.state == ShortcutState::Pressed {
+                let h = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let st = h.state::<RecState>();
+                    let shared = st.0.clone();
+                    let mut r = shared.lock().await;
+                    if r.is_recording() || r.is_paused() {
+                        if let Err(e) = r.stop_recording(&h).await {
                             drop(r);
                             op_err(&h, &e);
                         }
-                    });
-                }
-            });
-        }
-        if let Some(sc) = parse_hotkey(&s.rec_stop_hotkey) {
-            let _ = gs.on_shortcut(sc, move |app, _sc, event| {
-                if event.state == ShortcutState::Pressed {
-                    let h = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let st = h.state::<RecState>();
-                        let shared = st.0.clone();
-                        let mut r = shared.lock().await;
-                        if r.is_recording() || r.is_paused() {
-                            if let Err(e) = r.stop_recording(&h).await {
-                                drop(r);
-                                op_err(&h, &e);
-                            }
-                        }
-                    });
-                }
-            });
-        }
-    }
-    if eq(&s.rec_pause_hotkey, &s.rec_resume_hotkey) {
-        if let Some(sc) = parse_hotkey(&s.rec_pause_hotkey) {
-            let _ = gs.on_shortcut(sc, move |app, _sc, event| {
-                if event.state == ShortcutState::Pressed {
-                    rec_pause_toggle(app);
-                }
-            });
-        }
-    } else {
-        if let Some(sc) = parse_hotkey(&s.rec_pause_hotkey) {
-            let _ = gs.on_shortcut(sc, move |app, _sc, event| {
-                if event.state == ShortcutState::Pressed {
-                    rec_pause_toggle(app);
-                }
-            });
-        }
-        if let Some(sc) = parse_hotkey(&s.rec_resume_hotkey) {
-            let _ = gs.on_shortcut(sc, move |app, _sc, event| {
-                if event.state == ShortcutState::Pressed {
-                    rec_pause_toggle(app);
-                }
-            });
-        }
-    }
-    if let Some(sc) = parse_hotkey(&s.replay_save_hotkey) {
-        let _ = gs.on_shortcut(sc, move |app, _sc, event| {
-            if event.state == ShortcutState::Pressed {
-                replay_save_now(app);
+                    }
+                });
             }
         });
     }
+    if eq(&s.rec_pause_hotkey, &s.rec_resume_hotkey) {
+        reg!("Pause/Resume recording", &s.rec_pause_hotkey, move |app, _sc, event| {
+            if event.state == ShortcutState::Pressed {
+                rec_pause_toggle(app);
+            }
+        });
+    } else {
+        reg!("Pause recording", &s.rec_pause_hotkey, move |app, _sc, event| {
+            if event.state == ShortcutState::Pressed {
+                rec_pause_toggle(app);
+            }
+        });
+        reg!("Resume recording", &s.rec_resume_hotkey, move |app, _sc, event| {
+            if event.state == ShortcutState::Pressed {
+                rec_pause_toggle(app);
+            }
+        });
+    }
+    reg!("Save Instant Replay", &s.replay_save_hotkey, move |app, _sc, event| {
+        if event.state == ShortcutState::Pressed {
+            replay_save_now(app);
+        }
+    });
+    failed
 }
 
 #[tauri::command]
-fn hotkeys_apply(app: tauri::AppHandle, s: AppSettings) -> Result<(), String> {
-    register_hotkeys(&app, &s);
-    Ok(())
+fn hotkeys_apply(app: tauri::AppHandle, s: AppSettings) -> Result<Vec<String>, String> {
+    Ok(register_hotkeys(&app, &s))
 }
 
 fn main() {
@@ -864,7 +1037,13 @@ fn main() {
             rec_probe,
             rec_probe_refresh,
             ffmpeg_ensure,
+            audio_devices,
+            audio_level_test,
+            media_info,
+            native_probe,
+            perf_extra,
             rec_status,
+            rec_countdown_cancel,
             rec_start_area,
             rec_start_default,
             rec_stop,
@@ -945,7 +1124,7 @@ fn main() {
                     let st = h.state::<RecState>();
                     let shared = st.0.clone();
                     let mut r = shared.lock().await;
-                    let _ = r.replay_start(&h).await;
+                    let _ = r.replay_start(shared.clone(), &h).await;
                 });
             }
             Ok(())

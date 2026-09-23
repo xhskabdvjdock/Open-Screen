@@ -63,6 +63,8 @@ pub struct AppSettings {
     pub rec_post_action: String,
     pub rec_history_limit: usize,
     pub rec_power_saving: bool,
+    pub rec_countdown: u64,
+    pub rec_hw_mode: String,
     // ---- Instant Replay ----
     pub replay_enabled: bool,
     pub replay_autostart: bool,
@@ -120,7 +122,7 @@ impl Default for AppSettings {
             rec_bitrate: "auto".to_string(),
             rec_bitrate_custom: 12,
             rec_codec: "auto".to_string(),
-            rec_audio: "none".to_string(),
+            rec_audio: "system".to_string(),
             rec_mic_device: "".to_string(),
             rec_sample_rate: 48000,
             rec_channels: 2,
@@ -129,6 +131,8 @@ impl Default for AppSettings {
             rec_post_action: "nothing".to_string(),
             rec_history_limit: 25,
             rec_power_saving: false,
+            rec_countdown: 3,
+            rec_hw_mode: "auto".to_string(),
             // replay
             replay_enabled: false,
             replay_autostart: false,
@@ -207,6 +211,13 @@ pub fn load_settings() -> AppSettings {
             }
             if s.replay_duration > 600 {
                 s.replay_duration = 600;
+            }
+            s.rec_countdown = match s.rec_countdown {
+                0 | 3 | 5 | 10 => s.rec_countdown,
+                _ => 3,
+            };
+            if s.rec_hw_mode != "hw" && s.rec_hw_mode != "sw" {
+                s.rec_hw_mode = "auto".to_string();
             }
             s
         }

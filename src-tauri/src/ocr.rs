@@ -23,10 +23,18 @@ pub struct OcrResult {
     pub ms: u128,
 }
 
+fn looks_like_real_binary(p: &PathBuf) -> bool {
+    // Same LFS-stub guard as the recorder: a real tesseract.exe is hundreds
+    // of KB; an unpulled checkout holds a ~130-byte pointer text file.
+    std::fs::metadata(p).map(|m| m.len() > 50_000).unwrap_or(false)
+}
+
 fn find_tesseract() -> Option<PathBuf> {
     // 1) Shipped inside the installer — always preferred, no download needed.
     if let Some(p) = crate::settings::bundled_file("tesseract/tesseract.exe") {
-        return Some(p);
+        if looks_like_real_binary(&p) {
+            return Some(p);
+        }
     }
     if let Ok(p) = which_tesseract() {
         return Some(p);

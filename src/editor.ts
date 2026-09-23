@@ -489,6 +489,12 @@ async function autoBehaviors() {
     } catch { /* non-blocking */ }
   }
   if (settings.ocrAuto && settings.ocrEnabled) {
+    // Never auto-run OCR while a recording/replay buffer is active —
+    // keep the capture pipeline smooth; manual OCR still works on demand.
+    try {
+      const st = await invoke<{ recording: boolean; paused: boolean; replay: string }>("rec_status");
+      if (st.recording || st.paused || st.replay !== "off") return;
+    } catch { /* fall through to OCR */ }
     openOcrPanel();
     void runOcr();
   }

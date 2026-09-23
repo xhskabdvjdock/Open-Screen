@@ -207,12 +207,101 @@ async function finishRegion() {
   await finishSelection(cropBg(x0, y0, rw, rh));
 }
 
+/** Countdown overlay (3-2-1) before recording. Shown on the picker window
+ *  BEFORE capture starts, so it never appears in the final video.
+ *  Esc cancels (returns false, no recording). */
+let countdownCancelled = false;
+let countdownShowing = false;
+/** Hotkey-path countdown driven by the backend (Rust shows this window,
+ *  emits `openscreen:countdown`, then hides it before capture starts). */
+let hotkeyCountdown = false;
+function ensureCountdownEl(): HTMLElement {
+  let el = document.getElementById("countdown");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "countdown";
+    // Fullscreen stage so the count sits in the middle of the screen.
+    // Never part of any capture: recording starts only after it finishes
+    // and this window hides.
+    el.style.cssText =
+      "position:fixed;inset:0;display:none;align-items:center;justify-content:center;" +
+      "font-size:130px;font-weight:800;color:#fff;background:rgba(0,0,0,.55);z-index:9999;" +
+      "font-family:'Segoe UI',system-ui,sans-serif;user-select:none;";
+    document.body.appendChild(el);
+  }
+  return el;
+}
+/** Hotkey path: transparent stage (no dim), banner only. */
+function setHotkeyStage(on: boolean) {
+  hotkeyCountdown = on;
+  canvas.style.display = on ? "none" : "block";
+  const hint = document.getElementById("hint");
+  if (hint) hint.style.display = on ? "none" : "flex";
+  document.body.style.background = on ? "transparent" : "";
+}
+function showBanner(text: string) {
+  const el = ensureCountdownEl();
+  el.textContent = text;
+  el.style.display = "flex";
+}
+function hideBanner() {
+  const el = document.getElementById("countdown");
+  if (el) el.style.display = "none";
+}
+async function loadCountdownSecs(): Promise<number> {
+  try {
+    const { loadSettings } = await import("./common");
+    const s = await loadSettings();
+    const v = (s as unknown as Record<string, unknown>).recCountdown;
+    const n = typeof v === "number" ? v : 3;
+    return n === 0 || n === 3 || n === 5 || n === 10 ? n : 3;
+  } catch {
+    return 3;
+  }
+}
+async function runCountdown(): Promise<boolean> {
+  const secs = await loadCountdownSecs();
+  if (!secs) return true; // Off: start immediately
+  ensureCountdownEl();
+  countdownCancelled = false;
+  countdownShowing = true;
+  start = cur = null;
+  draw();
+  for (let i = secs; i >= 1; i--) {
+    if (countdownCancelled) {
+      hideBanner();
+      countdownShowing = false;
+      return false;
+    }
+    showBanner(`⬤ ${i}`);
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  if (countdownCancelled) {
+    hideBanner();
+    countdownShowing = false;
+    return false;
+  }
+  showBanner("⬤ Recording");
+  await new Promise((r) => setTimeout(r, 500));
+  hideBanner();
+  countdownShowing = false;
+  return true;
+}
+
 /** Start a screen recording of a virtual-screen rect. Overlay hides first. */
 async function startAreaRecording(vx: number, vy: number, w: number, h: number) {
   if (w < 16 || h < 16) {
     await toastMsg("Area too small to record");
     start = cur = null;
     draw();
+    return;
+  }
+  // Countdown BEFORE hiding (visible to user, never in video since capture
+  // starts only after it finishes).
+  const go = await runCountdown();
+  if (!go) {
+    start = cur = null;
+    await closeOverlay();
     return;
   }
   start = cur = null;
@@ -306,6 +395,7 @@ function pos(e: MouseEvent): { x: number; y: number } {
 }
 
 canvas.addEventListener("mousedown", (e) => {
+  if (hotkeyCountdown) return;
   if (e.button !== 0 || !bgImg) return;
   start = pos(e);
   cur = { ...start };
@@ -318,8 +408,15 @@ window.addEventListener("mousemove", (e) => {
 });
 window.addEventListener("mouseup", () => { void finishRegion(); });
 window.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") void closeOverlay();
-  else if (e.key === "f" || e.key === "F") void captureSpecial("fullscreen");
+  if (e.key === "Escape") {
+    // Hotkey path first: must notify the backend, not just stop the banner.
+    if (hotkeyCountdown) void cancelHotkeyCountdown();
+    else if (countdownShowing) countdownCancelled = true;
+    else void closeOverlay();
+    return;
+  }
+  if (hotkeyCountdown) return; // banner owns the stage: ignore F/W/A/Tab/Enter
+  if (e.key === "f" || e.key === "F") void captureSpecial("fullscreen");
   else if (e.key === "w" || e.key === "W") void captureSpecial("window");
   else if (e.key === "a" || e.key === "A") void captureSpecial("all");
   else if (e.key === "Enter") void captureSpecial("fullscreen");
@@ -359,12 +456,51 @@ function loadBgImage(b64: string): Promise<HTMLImageElement> {
   });
 }
 
+async function cancelHotkeyCountdown() {
+  countdownCancelled = true;
+  try {
+    await invoke("rec_countdown_cancel");
+  } catch { /* backend reads the flag regardless */ }
+  hideBanner();
+  setHotkeyStage(false);
+  await getCurrentWindow().hide().catch(() => {});
+}
+
+/** Backend-driven countdown (hotkey/tray path): top-center banner, Esc cancels. */
+async function onBackendCountdown(secs: number) {
+  if (!secs) return;
+  countdownCancelled = false;
+  countdownShowing = true;
+  setHotkeyStage(true);
+  start = cur = null;
+  for (let i = secs; i >= 1; i--) {
+    if (countdownCancelled) break;
+    showBanner(`⬤ ${i}`);
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  if (!countdownCancelled) showBanner("⬤ Recording");
+}
+
 async function init() {
   resize();
   // Stay hidden at startup — only shown via capture-start with a frozen background.
   await getCurrentWindow().hide().catch(() => {});
+  await listen<{ secs?: number }>("openscreen:countdown", async (ev) => {
+    await fitVirtualScreen(monitors);
+    void onBackendCountdown(ev.payload?.secs ?? 3);
+  });
+  await listen("openscreen:countdown-hide", async () => {
+    countdownShowing = false;
+    hideBanner();
+    setHotkeyStage(false);
+  });
   await listen<StartPayload>("openscreen:capture-start", async (ev) => {
     const p = ev.payload ?? {};
+    // A fresh picker run cancels any stale hotkey-countdown stage.
+    countdownCancelled = true;
+    countdownShowing = false;
+    hideBanner();
+    setHotkeyStage(false);
     const m = p.mode ?? "region";
     setMode(m === "ocr" ? "text" : m === "record" ? "record" : "image");
     start = cur = null;

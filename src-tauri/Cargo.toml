@@ -1,6 +1,6 @@
 [package]
 name = "open-screen"
-version = "0.1.0"
+version = "2.0.1"
 description = "Open Screen — lightweight screenshot + editor + local OCR"
 authors = ["Open Screen"]
 edition = "2021"
@@ -29,9 +29,19 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["clock"] }
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "stream"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
-futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots"] }
+sysinfo = "0.30"
+mp4 = "0.14"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.22"
+windows-capture = "2.0"
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Media_MediaFoundation",
+  "Win32_System_Com",
+] }
 
 [features]
 default = []

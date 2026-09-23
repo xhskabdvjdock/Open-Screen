@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+﻿import { invoke } from "@tauri-apps/api/core";
 
 export interface AppSettings {
   startWithWindows: boolean;
@@ -48,6 +48,8 @@ export interface AppSettings {
   recPostAction: string;
   recHistoryLimit: number;
   recPowerSaving: boolean;
+  recCountdown: number;
+  recHwMode: string;
   replayEnabled: boolean;
   replayAutostart: boolean;
   replayDuration: number;
@@ -95,7 +97,7 @@ export const defaultSettings: AppSettings = {
   recBitrate: "auto",
   recBitrateCustom: 12,
   recCodec: "auto",
-  recAudio: "none",
+  recAudio: "system",
   recMicDevice: "",
   recSampleRate: 48000,
   recChannels: 2,
@@ -104,6 +106,8 @@ export const defaultSettings: AppSettings = {
   recPostAction: "nothing",
   recHistoryLimit: 25,
   recPowerSaving: false,
+  recCountdown: 3,
+  recHwMode: "auto",
   replayEnabled: false,
   replayAutostart: false,
   replayDuration: 30,

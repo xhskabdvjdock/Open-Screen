@@ -62,13 +62,13 @@
       </section>
       <section data-tab="recording">
         <h4>Engine</h4>
-        <div class="field"><div>Recorder engine<small id="ffmpegLabel">ffmpeg ships inside the app installer — no download needed.</small></div><span class="row"><button class="btn" id="ffmpegCheck">Check</button><button class="btn primary" id="ffmpegDl">Re-download engine (fallback)</button></span></div>
-        <div id="ffmpegProg" class="hidden"><p class="muted">Downloading recorder engine… <span id="ffmpegPct">0%</span></p></div>
+        <div class="field"><div>Recorder engine<small id="ffmpegLabel">Native engine (Windows Graphics Capture + Media Foundation + WASAPI) — built in, nothing to download.</small></div><span class="row"><button class="btn" id="ffmpegCheck">Check</button><button class="btn primary" id="ffmpegDl">Verify engine</button></span></div>
         <h4>General</h4>
         <div class="field"><div>Default source<small>Used by the Start hotkey. Tray opens the visual picker.</small></div><select id="recDefaultSource"><option value="fullscreen">Full Screen (primary)</option><option value="all">All Screens</option><option value="last_area">Last selected area</option><option value="window">Active Window (fixed area)</option></select></div>
         <div class="field"><div>Monitor<small>For “Monitor N” source.</small></div><select id="recMonitor"></select></div>
         <div class="field"><div>Recording folder<small id="recFolderLabel"></small></div><span class="row"><input type="text" id="recFolder" readonly style="width:260px" /><button class="btn" id="pickRecFolder">Select Folder</button></span></div>
-        <div class="field"><div>Show cursor<small>Default On for recordings.</small></div><input type="checkbox" id="recCursor" /></div>
+        <div class="field"><div>Show cursor<small>Default On for recordings. Stable native cursor, no flicker.</small></div><input type="checkbox" id="recCursor" /></div>
+        <div class="field"><div>Recording countdown<small>Overlay 3-2-1 before start (never in the video). Esc cancels. Replay save has no countdown.</small></div><select id="recCountdown"><option value="0">Off</option><option value="3">3 seconds</option><option value="5">5 seconds</option><option value="10">10 seconds</option></select></div>
         <div class="field"><div>After recording</div><select id="recPostAction"><option value="nothing">Do Nothing</option><option value="open_file">Open Video</option><option value="open_folder">Open Folder</option><option value="copy_path">Copy File Path</option></select></div>
         <div class="field"><div>Recording history limit<small>Metadata only — videos never load to RAM.</small></div><select id="recHistoryLimit"><option value="10">10</option><option value="25">25</option><option value="50">50</option><option value="100">100</option><option value="0">Disabled</option></select></div>
         <div class="field"><div>Power Saving<small>30 FPS, lower bitrate, prefers hardware encoding. For laptops.</small></div><input type="checkbox" id="recPowerSaving" /></div>
@@ -81,13 +81,18 @@
         <div class="field"><div>Bitrate<small>Auto = from quality preset.</small></div><select id="recBitrate"><option value="auto">Auto</option><option value="5">5 Mbps</option><option value="8">8 Mbps</option><option value="12">12 Mbps</option><option value="20">20 Mbps</option><option value="30">30 Mbps</option><option value="custom">Custom</option></select></div>
         <div class="field"><div>Custom bitrate (Mbps)</div><input type="number" id="recBitrateCustom" min="1" max="100" /></div>
         <div class="field"><div>Codec<small id="codecNote">H.264 default. Only supported codecs are listed.</small></div><select id="recCodec"><option value="auto">Auto (H.264, best encoder)</option><option value="h264">H.264</option><option value="hevc">HEVC / H.265</option><option value="av1">AV1</option></select></div>
+        <div class="field"><div>Hardware encoding<small>Auto = HW first, SW fallback. HW-only never uses CPU encoding.</small></div><select id="recHwMode"><option value="auto">Auto (HW → SW fallback)</option><option value="hw">Hardware only</option><option value="sw">Software only</option></select></div>
+
         <h4>Audio</h4>
-        <div class="field"><div>Audio<small>Video keeps recording if audio is unavailable.</small></div><select id="recAudio"><option value="none">None</option><option value="mic">Microphone</option><option value="system">System Audio</option><option value="both">Both (mixed)</option></select></div>
-        <div class="field"><div>Microphone device</div><select id="recMicDevice"></select></div>
+        <div class="field"><div>Audio<small>WASAPI loopback for system (no Stereo Mix needed). Video keeps recording if audio is unavailable.</small></div><select id="recAudio"><option value="none">None</option><option value="mic">Microphone</option><option value="system">System Audio</option><option value="both">Both (mixed)</option></select></div>
+        <div class="field"><div>Microphone device<small id="micListNote">Real WASAPI devices only.</small></div><span class="row"><select id="recMicDevice"></select><button class="btn" id="audioRefresh">Refresh devices</button></span></div>
+        <div class="field"><div>System audio<small id="sysAudioLabel">WASAPI loopback</small></div><span class="row"><button class="btn" id="testSysAudio">Test system audio</button><button class="btn" id="testMic">Test microphone</button></span></div>
+        <div class="field"><div>Levels<small id="audioLevels">Idle — start a test or recording to see real input levels.</small></div><button class="btn" id="audioLevelsRefresh">Refresh levels</button></div>
         <div class="field"><div>Sample rate</div><select id="recSampleRate"><option value="44100">44.1 kHz</option><option value="48000">48 kHz</option></select></div>
         <div class="field"><div>Channels</div><select id="recChannels"><option value="1">Mono</option><option value="2">Stereo</option></select></div>
         <h4>Advanced</h4>
-        <div class="field"><div>Performance<small id="recPerf">Idle. Start a recording to see encoder, FPS, frames, size, levels.</small></div><button class="btn" id="recPerfRefresh">Refresh</button></div>
+        <div class="field"><div>Capture API<small id="captureApiLabel">Auto: ddagrab (smooth) → gdigrab fallback.</small></div><button class="btn" id="recPerfRefresh">Refresh</button></div>
+        <div class="field"><div>Performance<small id="recPerf">Idle. Start a recording to see encoder, FPS, frames, size, levels.</small></div><button class="btn" id="recPerfRefresh2">Refresh</button></div>
         <p class="muted">Temporary files live in the system temp folder and are deleted after each recording. Nothing is uploaded — all processing is local.</p>
       </section>
       <section data-tab="replay">
@@ -106,7 +111,7 @@
         <p class="muted">Open Screen follows your Windows theme (light/dark) automatically. Minimal, native styling — no heavy animations.</p>
       </section>
       <section data-tab="about">
-        <h3>Open Screen 0.1.0</h3>
+        <h3>Open Screen 2.0.1</h3>
         <p class="muted">Screenshot Tool + Lightweight Image Editor + Local OCR. Local-first: no cloud, no screenshot uploads. Capture fast. Edit when needed. OCR when needed. Save only when needed.</p>
       </section>
     </div>

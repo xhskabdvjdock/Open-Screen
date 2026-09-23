@@ -1,4 +1,4 @@
-//! Screen recording + Instant Replay backend.
+﻿//! Screen recording + Instant Replay backend.
 //!
 //! Strategy (lightweight, local-first):
 //! - Video capture/encode via ffmpeg (probed, one-time lazy download like Tesseract).
@@ -12,407 +12,246 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex as StdMutex,
+    Arc,
 };
 use std::time::{Duration, Instant};
 
 use crate::settings::{self, AppSettings};
-use tauri::Emitter;
 
-// ---------------------------------------------------------------------------
-// ffmpeg discovery / download
-// ---------------------------------------------------------------------------
-
-const FFMPEG_URL: &str =
-    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
-
-fn ffmpeg_exe_name() -> &'static str {
-    if cfg!(windows) {
-        "ffmpeg.exe"
-    } else {
-        "ffmpeg"
-    }
-}
-
-fn bundled_ffmpeg() -> PathBuf {
-    settings::app_dir().join("ffmpeg").join(ffmpeg_exe_name())
-}
-
-fn path_search(name: &str) -> Option<PathBuf> {
-    if let Ok(paths) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let p = dir.join(name);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
-
-pub fn ffmpeg_path() -> Option<PathBuf> {
-    // 1) Shipped inside the installer — always preferred, no download needed.
-    if let Some(p) = crate::settings::bundled_file("ffmpeg/ffmpeg.exe") {
-        return Some(p);
-    }
-    if let Some(p) = path_search(ffmpeg_exe_name()) {
-        return Some(p);
-    }
-    let b = bundled_ffmpeg();
-    if b.exists() {
-        return Some(b);
-    }
-    None
-}
-
-fn ffmpeg_version(ff: &Path) -> String {
-    crate::procutil::cmd(ff)
-        .arg("-version")
-        .output()
-        .ok()
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .next()
-                .unwrap_or("")
-                .to_string()
-                .into()
-        })
-        .unwrap_or_default()
+/// Debug-build pipeline log (never screen/audio content â€” config only).
+macro_rules! dbg_pipe {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        eprintln!("[open-screen] {}", format!($($arg)*));
+    };
 }
 
 // ---------------------------------------------------------------------------
-// Probe (encoders + audio devices), cached
+// Native engine: Windows Graphics Capture + Media Foundation + WASAPI.
+// No external processes, no downloads, no bundled binaries â€” the engine IS
+// the OS. Everything below reports what is ACTUALLY present on this machine.
+// ---------------------------------------------------------------------------
+
+/// The one and only capture backend. No fallback chain to misreport.
+pub const NATIVE_CAPTURE_API: &str = "Windows Graphics Capture";
+
+// ---------------------------------------------------------------------------
+// Probe (capture backend + encoder MFTs + audio devices), cached
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Probe {
+    /// Legacy key kept for UI compat; always empty (no external binary).
     pub ffmpeg: String,
     pub version: String,
+    /// Real encoder MFT friendly names present on THIS machine
+    /// (e.g. "NVIDIA H.264 Encoder MFT", "H264 Encoder MFT").
     pub h264: Vec<String>,
     pub hevc: Vec<String>,
+    /// AV1 hardware encode is not offered (no inbox AV1 encoder MFT).
     pub av1: Vec<String>,
     pub audio_devices: Vec<String>,
     pub system_hint: Option<String>,
+    pub capture_api: String,
+    pub has_ddagrab: bool,
+    pub wasapi_mics: Vec<String>,
+    pub wasapi_system: Option<String>,
 }
 
 fn probe_path() -> PathBuf {
-    settings::app_dir().join("ffmpeg_probe.json")
+    settings::app_dir().join("native_probe.json")
 }
 
-fn run_probe(ff: &Path) -> Probe {
+fn run_probe() -> Probe {
     let mut p = Probe {
-        ffmpeg: ff.to_string_lossy().to_string(),
-        version: ffmpeg_version(ff),
+        version: "native".to_string(),
+        capture_api: NATIVE_CAPTURE_API.to_string(),
         ..Default::default()
     };
-    if let Ok(o) = crate::procutil::cmd(ff)
-        .args(["-hide_banner", "-encoders"])
-        .output()
-    {
-        let txt = String::from_utf8_lossy(&o.stdout);
-        for line in txt.lines() {
-            for enc in [
-                "h264_nvenc",
-                "h264_qsv",
-                "h264_amf",
-                "libx264",
-                "hevc_nvenc",
-                "hevc_qsv",
-                "hevc_amf",
-                "libx265",
-                "av1_nvenc",
-                "av1_qsv",
-                "av1_amf",
-            ] {
-                if line.contains(enc) {
-                    let list = if enc.starts_with("h264") {
-                        &mut p.h264
-                    } else if enc.starts_with("hevc") || enc == "libx265" {
-                        &mut p.hevc
-                    } else {
-                        &mut p.av1
-                    };
-                    if !list.iter().any(|e| e == enc) {
-                        list.push(enc.to_string());
-                    }
-                }
-            }
-        }
-    }
-    // DirectShow audio devices (Windows). Best-effort: video-only if none.
     #[cfg(target_os = "windows")]
     {
-        if let Ok(o) = crate::procutil::cmd(ff)
-            .args(["-list_devices", "true", "-f", "dshow", "-i", "dummy"])
-            .output()
-        {
-            let txt = format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            );
-            let mut in_audio = false;
-            for line in txt.lines() {
-                let l = line.trim().to_lowercase();
-                if l.contains("directshow audio devices") {
-                    in_audio = true;
-                    continue;
-                }
-                if l.contains("directshow video devices") {
-                    in_audio = false;
-                    continue;
-                }
-                if in_audio {
-                    // lines look like: [dshow ...]  "Microphone (XYZ)"
-                    if let Some(a) = line.find('"') {
-                        if let Some(b) = line[a + 1..].find('"') {
-                            let name = line[a + 1..a + 1 + b].to_string();
-                            if !name.is_empty() && name != "dummy" {
-                                p.audio_devices.push(name);
-                            }
-                        }
-                    }
-                }
+        // Media Foundation encoder MFTs that REALLY exist here. Hardware
+        // first, inbox software always as fallback â€” never offer ghosts.
+        let hw = crate::mfhw::probe_hw_encoders();
+        p.h264.extend(hw.h264_hw.iter().cloned());
+        p.hevc.extend(hw.hevc_hw.iter().cloned());
+        for n in crate::mfhw::probe_sw("h264") {
+            if !p.h264.iter().any(|e| e == &n) {
+                p.h264.push(n);
             }
         }
-        // Heuristic system-audio (loopback) endpoint.
-        p.system_hint = p
-            .audio_devices
-            .iter()
-            .find(|n| {
-                let l = n.to_lowercase();
-                l.contains("stereo mix")
-                    || l.contains("what u hear")
-                    || l.contains("loopback")
-                    || l.contains("mix")
-                    || l.contains("wave out")
-            })
-            .cloned();
+        for n in crate::mfhw::probe_sw("hevc") {
+            if !p.hevc.iter().any(|e| e == &n) {
+                p.hevc.push(n);
+            }
+        }
+        let wad = crate::audio::list_audio_devices();
+        p.wasapi_mics = wad.mics;
+        p.wasapi_system = wad.system.clone();
+        // WASAPI loopback needs no "Stereo Mix" â€” the render endpoint IS the
+        // system-audio source.
+        p.system_hint = wad.system;
     }
     p
 }
 
 pub fn get_probe(refresh: bool) -> Result<Probe, String> {
-    let ff = ffmpeg_path().ok_or_else(|| {
-        "Recorder engine (ffmpeg) is missing. Open Settings → Recording and download it once (~80MB). / محرك التسجيل غير موجود — حمّله من الإعدادات.".to_string()
-    })?;
-    if !refresh {
-        if let Ok(bytes) = std::fs::read(probe_path()) {
-            if let Ok(mut p) = serde_json::from_slice::<Probe>(&bytes) {
-                if p.ffmpeg == ff.to_string_lossy().to_string() {
-                    // refresh device list cheaply? keep cache for speed
-                    return Ok(std::mem::take(&mut p));
-                }
-            }
-        }
-    }
-    let p = run_probe(&ff);
-    let _ = std::fs::create_dir_all(settings::app_dir());
-    if let Ok(bytes) = serde_json::to_vec_pretty(&p) {
-        let _ = std::fs::write(probe_path(), bytes);
-    }
-    Ok(p)
-}
-
-fn hw_label(e: &str) -> &'static str {
-    if e.contains("nvenc") {
-        "NVIDIA NVENC"
-    } else if e.contains("qsv") {
-        "Intel Quick Sync"
-    } else if e.contains("amf") {
-        "AMD AMF"
-    } else {
-        "Software (CPU)"
-    }
-}
-
-fn is_hw_encoder(e: &str) -> bool {
-    e.contains("nvenc") || e.contains("qsv") || e.contains("amf")
-}
-
-#[derive(Debug, Clone)]
-struct EncCand {
-    name: String,
-    label: String,
-}
-
-/// Encoder fallback chain: hardware first (as chosen/probed), software last.
-/// A listed encoder is NOT proof it can open (e.g. NVENC without NVIDIA GPU),
-/// so every candidate is actually tried at startup — first success wins.
-fn encoder_chain(probe: &Probe, codec: &str) -> Vec<EncCand> {
-    let mut chain: Vec<EncCand> = vec![];
-    let mut push = |names: &[&str], avail: &[String]| {
-        for n in names {
-            if avail.iter().any(|e| e == n) && !chain.iter().any(|c: &EncCand| c.name == *n) {
-                chain.push(EncCand {
-                    name: n.to_string(),
-                    label: hw_label(n).to_string(),
-                });
-            }
-        }
-    };
-    match codec {
-        "hevc" => {
-            push(&["hevc_nvenc", "hevc_qsv", "hevc_amf", "libx265"], &probe.hevc);
-        }
-        "av1" => {
-            // Hardware AV1 only — software AV1 is too heavy for realtime.
-            push(&["av1_nvenc", "av1_qsv", "av1_amf"], &probe.av1);
-        }
-        _ => {}
-    }
-    // H.264 is always the final fallback (most compatible).
-    push(
-        &["h264_nvenc", "h264_qsv", "h264_amf", "libx264"],
-        &probe.h264,
-    );
-    if chain.is_empty() {
-        chain.push(EncCand {
-            name: "libx264".to_string(),
-            label: "Software (CPU)".to_string(),
-        });
-    }
-    chain
-}
-
-// ---------------------------------------------------------------------------
-// One-time ffmpeg download (~80MB essentials build, ffmpeg.exe only)
-// ---------------------------------------------------------------------------
-
-pub async fn ensure_ffmpeg(app: tauri::AppHandle) -> Result<String, String> {
-    if let Some(p) = ffmpeg_path() {
-        return Ok(p.to_string_lossy().to_string());
-    }
-    let dir = settings::app_dir().join("ffmpeg");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let client = reqwest::Client::builder()
-        .user_agent("OpenScreen/0.1")
-        .build()
-        .map_err(|e| e.to_string())?;
-    // Mirror list: official build first, GitHub mirrors after (some networks
-    // block individual hosts).
-    let mut urls = vec![FFMPEG_URL.to_string()];
-    urls.extend(github_ffmpeg_mirrors(&client).await);
-    let mut last_err = String::from("download failed");
-    for url in urls {
-        match try_fetch_ffmpeg(&client, &url, &dir, &app).await {
-            Ok(p) => return Ok(p.to_string_lossy().to_string()),
-            Err(e) => {
-                last_err = e;
-            }
-        }
-    }
-    Err(format!("{last_err}. Check internet and retry. / فشل التحميل — تحقق من الإنترنت."))
-}
-
-/// Discover ffmpeg Windows builds on GitHub mirrors (Gyan releases).
-async fn github_ffmpeg_mirrors(client: &reqwest::Client) -> Vec<String> {
-    let mut out = vec![];
-    let api = "https://api.github.com/repos/GyanD/codeffmpeg/releases/latest";
-    if let Ok(resp) = client
-        .get(api)
-        .header("User-Agent", "OpenScreen/0.1")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
+    #[cfg(not(target_os = "windows"))]
     {
-        if let Ok(bytes) = resp.bytes().await {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if let Some(assets) = v.get("assets").and_then(|a| a.as_array()) {
-                    for a in assets {
-                        if let Some(url) =
-                            a.get("browser_download_url").and_then(|u| u.as_str())
-                        {
-                            if url.contains("essentials_build.zip") {
-                                out.push(url.to_string());
-                                break;
-                            }
+        let _ = refresh;
+        return Err("Screen recording requires Windows.".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if !refresh {
+            if let Ok(bytes) = std::fs::read(probe_path()) {
+                if let Ok(mut p) = serde_json::from_slice::<Probe>(&bytes) {
+                    if p.version == "native" && p.capture_api == NATIVE_CAPTURE_API {
+                        // MFT/WASAPI sets only grow: refresh cheaply merges live
+                        // audio devices (handles hot-plugged microphones).
+                        let live = crate::audio::list_audio_devices();
+                        if !live.mics.is_empty() {
+                            p.wasapi_mics = live.mics;
                         }
+                        if live.system.is_some() {
+                            p.wasapi_system = live.system;
+                            p.system_hint = p.wasapi_system.clone();
+                        }
+                        return Ok(std::mem::take(&mut p));
                     }
                 }
             }
         }
+        let p = run_probe();
+        let _ = std::fs::create_dir_all(settings::app_dir());
+        if let Ok(bytes) = serde_json::to_vec_pretty(&p) {
+            let _ = std::fs::write(probe_path(), bytes);
+        }
+        Ok(p)
     }
-    out
 }
 
-async fn try_fetch_ffmpeg(
-    client: &reqwest::Client,
-    url: &str,
-    dir: &Path,
-    app: &tauri::AppHandle,
-) -> Result<PathBuf, String> {
-    let zip_path = dir.join("ffmpeg-release-essentials.zip");
-    let resp = client.get(url).send().await.map_err(|e| {
-        format!("error sending request for url ({url}). {e}")
-    })?;
-    if !resp.status().is_success() {
-        return Err(format!("Download failed (HTTP {}).", resp.status()));
+/// A friendly name is a HARDWARE MFT when it is not the inbox software one.
+/// (Inbox: "H264 Encoder MFT". Anything else, e.g. "NVIDIA H.264 Encoder
+/// MFT", is vendor hardware.)
+fn is_hw_mft_name(n: &str) -> bool {
+    let l = n.to_lowercase();
+    !(l == "h264 encoder mft" || l.contains("microsoft"))
+}
+
+pub fn encoder_label(probe: &Probe, codec: &str) -> String {
+    let pool = match codec {
+        "hevc" => &probe.hevc,
+        _ => &probe.h264,
+    };
+    if let Some(n) = pool.iter().find(|n| is_hw_mft_name(n)) {
+        // Vendor from the live MFT enumeration (not a hardcoded table).
+        let vendor = crate::mfhw::probe_hw_encoders().vendor().unwrap_or_else(|| n.clone());
+        return format!("Hardware â€” {vendor}");
     }
-    let total = resp.content_length().unwrap_or(0);
-    use futures_util::StreamExt;
-    let mut stream = resp.bytes_stream();
-    let mut file = tokio::fs::File::create(&zip_path)
-        .await
-        .map_err(|e| e.to_string())?;
-    use tokio::io::AsyncWriteExt;
-    let mut done: u64 = 0;
-    let mut last_pct: u64 = 0;
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk.map_err(|e| e.to_string())?;
-        file.write_all(&bytes).await.map_err(|e| e.to_string())?;
-        done += bytes.len() as u64;
-        if total > 0 {
-            let pct = done * 100 / total;
-            if pct >= last_pct + 2 {
-                last_pct = pct;
-                let _ = app.emit(
-                    "openscreen:ffmpeg-progress",
-                    serde_json::json!({ "pct": pct, "done": true }),
-                );
+    "Software (CPU)".to_string()
+}
+
+#[derive(Debug, Clone)]
+struct EncCand {
+    codec: crate::nativerec::NativeCodec,
+    hw: bool,
+    label: String,
+}
+
+/// Native codec choice from the MFTs actually present: hardware MFTs win,
+/// inbox software is the fallback. Returns (codec, is_hw, label).
+/// `hw_mode`: "hw" = refuse software (error when absent), "sw" = force the
+/// inbox software MFT, "auto" = hardware first, software fallback.
+/// AV1 is never offered (no inbox AV1 encoder MFT exists).
+fn pick_native_codec(
+    probe: &Probe,
+    codec: &str,
+    hw_mode: &str,
+) -> Result<(EncCand, Option<String>), String> {
+    use crate::nativerec::NativeCodec;
+    // Requested codec, or H.264 when the request names something absent
+    // (HEVC with no HEVC MFT, or AV1 which has no inbox encoder at all).
+    let mut want = match codec {
+        "hevc" if !probe.hevc.is_empty() => "hevc",
+        "hevc" | "av1" => "h264",
+        _ => "h264",
+    };
+    let mut note = if want != codec {
+        Some(format!("{codec} unavailable â€” using H.264 instead."))
+    } else {
+        None
+    };
+    let pool = if want == "hevc" { &probe.hevc } else { &probe.h264 };
+    let pick_hw = pool.iter().any(|n| is_hw_mft_name(n));
+    let pick_sw = pool.iter().any(|n| !is_hw_mft_name(n));
+    let (native, hw) = match hw_mode {
+        "hw" => {
+            if pick_hw {
+                (if want == "hevc" { NativeCodec::Hevc } else { NativeCodec::H264 }, true)
+            } else {
+                return Err("Hardware encoding requested but no hardware encoder MFT found. Switch to Auto or Software.".to_string());
             }
         }
-    }
-    file.flush().await.map_err(|e| e.to_string())?;
-    drop(file);
-    // Extract ffmpeg.exe only.
-    let dir_c = dir.to_path_buf();
-    let zip_c = zip_path.clone();
-    let found = tokio::task::spawn_blocking(move || {
-        let f = std::fs::File::open(&zip_c).map_err(|e| e.to_string())?;
-        let mut zip = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
-        for i in 0..zip.len() {
-            let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
-            let name = entry.name().replace('\\', "/");
-            if name.to_lowercase().ends_with("/ffmpeg.exe") || name.to_lowercase() == "ffmpeg.exe" {
-                let out = dir_c.join("ffmpeg.exe");
-                let mut w = std::fs::File::create(&out).map_err(|e| e.to_string())?;
-                std::io::copy(&mut entry, &mut w).map_err(|e| e.to_string())?;
-                return Ok::<PathBuf, String>(out);
+        "sw" => {
+            if pick_sw {
+                (if want == "hevc" { NativeCodec::Hevc } else { NativeCodec::H264 }, false)
+            } else if want == "hevc" && !probe.h264.is_empty() {
+                want = "h264";
+                note = Some("HEVC software MFT missing â€” using H.264.".to_string());
+                (NativeCodec::H264, false)
+            } else {
+                return Err("Software encoder MFT missing â€” cannot record.".to_string());
             }
         }
-        Err("ffmpeg.exe not found in archive".to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-    let _ = std::fs::remove_file(dir.join("ffmpeg-release-essentials.zip"));
-    // Verify it runs.
-    let v = ffmpeg_version(&found);
-    if v.is_empty() {
-        return Err("Downloaded ffmpeg does not run on this PC.".to_string());
+        _ => {
+            if pick_hw {
+                (if want == "hevc" { NativeCodec::Hevc } else { NativeCodec::H264 }, true)
+            } else if pick_sw {
+                (if want == "hevc" { NativeCodec::Hevc } else { NativeCodec::H264 }, false)
+            } else if want == "hevc" && !probe.h264.is_empty() {
+                // H.264 (inbox MFT) is the final safety net.
+                want = "h264";
+                note = Some("HEVC unavailable â€” using H.264.".to_string());
+                let hw2 = probe.h264.iter().any(|n| is_hw_mft_name(n));
+                (NativeCodec::H264, hw2)
+            } else {
+                return Err("No video encoder MFT found on this system.".to_string());
+            }
+        }
+    };
+    Ok((
+        EncCand { codec: native, hw, label: encoder_label(probe, want) },
+        note,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Native engine status: nothing to download â€” Media Foundation, WGC and
+// WASAPI ship with Windows. Kept as a command so the UI can report it.
+// ---------------------------------------------------------------------------
+
+/// Human-readable native engine summary for Settings.
+pub fn native_engine_info() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        match get_probe(false) {
+            Ok(p) => {
+                let enc = if !p.h264.is_empty() || !p.hevc.is_empty() {
+                    encoder_label(&p, "auto")
+                } else {
+                    "no encoder MFT".to_string()
+                };
+                format!("{} Â· {} Â· built-in (no download needed)", NATIVE_CAPTURE_API, enc)
+            }
+            Err(e) => e,
+        }
     }
-    let _ = app.emit(
-        "openscreen:ffmpeg-progress",
-        serde_json::json!({ "pct": 100, "done": true }),
-    );
-    // Prime the probe cache now.
-    let probe = run_probe(&found);
-    if let Ok(bytes) = serde_json::to_vec_pretty(&probe) {
-        let _ = std::fs::write(probe_path(), bytes);
+    #[cfg(not(target_os = "windows"))]
+    {
+        "Screen recording requires Windows.".to_string()
     }
-    Ok(found)
 }
 
 // ---------------------------------------------------------------------------
@@ -430,18 +269,19 @@ pub struct Area {
 #[derive(Debug, Clone)]
 pub struct Params {
     pub area: Area,
-    pub desktop: bool, // capture the whole virtual desktop (no offsets)
-    pub codec: String, // normalized choice: auto|h264|hevc|av1
+    /// Resolved codec actually used: "h264" or "hevc" (never av1).
+    pub codec: String,
+    pub codec_note: Option<String>,
     pub out_w: u32,
     pub out_h: u32,
     pub fps: u32,
-    pub encoder: String,
-    pub encoder_label: String,
-    pub sw_fallback_note: bool,
     pub bitrate_k: u32,
+    pub bitrate_bps: u32,
+    pub hw: bool,
+    pub encoder_label: String,
     pub audio: String,
     pub mic: Option<String>,
-    pub sys: Option<String>,
+    pub audio_note: Option<String>,
     pub sample_rate: u32,
     pub channels: u32,
     pub cursor: bool,
@@ -453,43 +293,44 @@ fn even(n: u32) -> u32 {
 }
 
 fn bitrate_for(quality: &str, height: u32) -> u32 {
-    // kbps ladder
+    // kbps ladder tuned so 1080p60 never looks like upscaled 720p.
+    // Balanced 1080p60 ~= 12M, Quality ~= 16M, VeryHigh ~= 20-24M.
     match quality {
         "low" => {
             if height >= 1080 {
-                5000
+                6000
             } else if height >= 720 {
-                3000
+                4000
             } else {
-                1500
+                2000
             }
         }
         "high" => {
             if height >= 1080 {
-                12000
+                16000
             } else if height >= 720 {
-                10000
+                12000
             } else {
-                5000
+                6000
             }
         }
         "veryhigh" => {
             if height >= 1080 {
-                20000
+                24000
             } else if height >= 720 {
-                16000
+                18000
             } else {
-                8000
+                9000
             }
         }
         _ => {
             // balanced
             if height >= 1080 {
-                8000
+                12000
             } else if height >= 720 {
-                6000
+                8000
             } else {
-                3000
+                4000
             }
         }
     }
@@ -502,17 +343,14 @@ fn resolve_audio(
 ) -> (String, Option<String>, Option<String>) {
     let mode = if replay { s.replay_audio.clone() } else { s.rec_audio.clone() };
     let mode = mode.to_lowercase();
-    let pick_mic = || -> Option<String> {
-        if !s.rec_mic_device.trim().is_empty()
-            && probe.audio_devices.iter().any(|d| d == &s.rec_mic_device)
-        {
-            return Some(s.rec_mic_device.clone());
-        }
-        // First non-loopback device as default mic.
+    // Prefer real WASAPI mics; fall back to dshow names for compat.
+    let mic_pool: Vec<String> = if !probe.wasapi_mics.is_empty() {
+        probe.wasapi_mics.clone()
+    } else {
         probe
             .audio_devices
             .iter()
-            .find(|d| {
+            .filter(|d| {
                 let l = d.to_lowercase();
                 !(l.contains("stereo mix")
                     || l.contains("what u hear")
@@ -520,15 +358,37 @@ fn resolve_audio(
                     || l.contains("wave out"))
             })
             .cloned()
+            .collect()
+    };
+    let pick_mic = || -> Option<String> {
+        if !s.rec_mic_device.trim().is_empty()
+            && (mic_pool.iter().any(|d| d == &s.rec_mic_device)
+                || probe.audio_devices.iter().any(|d| d == &s.rec_mic_device))
+        {
+            return Some(s.rec_mic_device.clone());
+        }
+        mic_pool
+            .first()
+            .cloned()
             .or_else(|| probe.audio_devices.first().cloned())
     };
+    // System audio = WASAPI loopback (always available when a render endpoint
+    // exists â€” no Stereo Mix needed). Missing endpoints degrade to a note,
+    // never to silent failure.
+    let sys_ok = probe.wasapi_system.is_some();
     match mode.as_str() {
         "mic" | "microphone" => ("mic".to_string(), pick_mic(), None),
-        "system" => ("system".to_string(), None, probe.system_hint.clone()),
+        "system" if sys_ok => ("system".to_string(), None, None),
+        "both" if sys_ok => ("both".to_string(), pick_mic(), None),
+        "system" => (
+            "none".to_string(),
+            None,
+            Some("System audio endpoint not found â€” recording video only.".to_string()),
+        ),
         "both" => (
-            "both".to_string(),
-            pick_mic(),
-            probe.system_hint.clone(),
+            "none".to_string(),
+            None,
+            Some("Audio endpoints not found â€” recording video only.".to_string()),
         ),
         _ => ("none".to_string(), None, None),
     }
@@ -539,8 +399,8 @@ fn resolve_params(
     probe: &Probe,
     area: Area,
     replay: bool,
-) -> Params {
-    // FPS (never 120 — only reliably supported options).
+) -> Result<Params, String> {
+    // FPS (never 120 â€” only reliably supported options).
     let mut fps = if replay { 30 } else { s.rec_fps };
     if replay {
         fps = match s.replay_preset.as_str() {
@@ -553,7 +413,8 @@ fn resolve_params(
         24 | 30 | 60 => fps,
         _ => 60,
     };
-    // Resolution.
+    // Resolution â€” QUALITY FIRST: Capture Resolution = Output Resolution.
+    // Never record low then upscale: out is always <= area (clamped).
     let (res_key, cw, ch) = if replay {
         match s.replay_preset.as_str() {
             "quick" => ("720p".to_string(), 0, 0),
@@ -569,16 +430,26 @@ fn resolve_params(
         "custom" => ch.max(240).min(2160),
         _ => area.h, // source
     };
-    if out_h > area.h && res_key != "custom" {
-        out_h = area.h; // never upscale for presets
+    // Never upscale â€” for presets AND custom. If the area is smaller than
+    // the preset, keep the area (capture == output, no fake upscale).
+    if out_h > area.h {
+        out_h = area.h;
     }
     let mut out_w = if res_key == "custom" && !replay {
-        cw.max(320).min(3840)
+        let want_w = cw.max(320).min(3840);
+        // Preserve aspect from area height, then clamp to area (no upscale).
+        let aspect_w = ((area.w as u64 * out_h as u64) / area.h.max(1) as u64) as u32;
+        want_w.min(aspect_w).min(area.w)
     } else if res_key == "source" {
         area.w
     } else {
         ((area.w as u64 * out_h as u64) / area.h.max(1) as u64) as u32
     };
+    // For presets the width follows height proportionally; also never upscale.
+    if res_key != "source" && res_key != "custom" && out_w > area.w {
+        out_w = area.w;
+        out_h = area.h;
+    }
     out_w = even(out_w);
     out_h = even(out_h);
     // Quality / bitrate.
@@ -607,21 +478,21 @@ fn resolve_params(
         (q, b)
     };
     let _ = quality;
-    // Codec -> fallback chain; start with the first candidate.
-    let codec = if replay {
-        "h264".to_string()
+    // Native codec from the MFTs actually present (HEVC only when an HEVC
+    // MFT exists; AV1 is never offered â€” no inbox encoder). H.264 default.
+    let want_codec = if replay {
+        "h264"
     } else {
         match s.rec_codec.as_str() {
-            "hevc" | "av1" => s.rec_codec.clone(),
-            _ => "auto".to_string(),
+            "hevc" => "hevc",
+            _ => "h264",
         }
     };
-    let chain = encoder_chain(probe, &codec);
-    let first = &chain[0];
-    let (encoder, encoder_label) = (first.name.clone(), first.label.clone());
-    let sw_fallback_note = !is_hw_encoder(&encoder);    // Audio.
-    let (audio, mic, sys) = resolve_audio(s, probe, replay);
-    // Power saving overrides.
+    let hw_mode = hw_mode_setting();
+    let (cand, codec_note) = pick_native_codec(probe, want_codec, &hw_mode)?;
+    // Audio (WASAPI loopback + mic; labels only).
+    let (audio, mic, audio_note) = resolve_audio(s, probe, replay);
+    // Power saving overrides (real: FPS cap + lower bitrate).
     let mut power_note = None;
     let mut fps_out = fps;
     let mut bitrate_out = bitrate_k;
@@ -630,80 +501,98 @@ fn resolve_params(
         bitrate_out = bitrate_k.min(bitrate_for("low", out_h));
         power_note = Some("Power saving active: 30 FPS, lower bitrate.".to_string());
     }
-    Params {
+    Ok(Params {
         area: Area {
             x: area.x,
             y: area.y,
             w: even(area.w),
             h: even(area.h),
         },
-        desktop: false, // set by the caller (full virtual desktop => no offsets)
-        codec,
+        codec: match cand.codec {
+            crate::nativerec::NativeCodec::Hevc => "hevc".to_string(),
+            _ => "h264".to_string(),
+        },
+        codec_note,
         out_w,
         out_h,
         fps: fps_out,
-        encoder,
-        encoder_label,
-        sw_fallback_note,
         bitrate_k: bitrate_out,
+        bitrate_bps: bitrate_out * 1000,
+        hw: cand.hw,
+        encoder_label: cand.label,
         audio,
         mic,
-        sys,
+        audio_note,
         sample_rate: if s.rec_sample_rate == 44100 { 44100 } else { 48000 },
         channels: if s.rec_channels == 1 { 1 } else { 2 },
         cursor: s.rec_cursor,
         power_note,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
-// Live stats
+// Recorder state (all live numbers come from atomics + file metadata â€”
+// no subprocess scraping)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default, Clone)]
-struct LiveStats {
-    frames: u64,
-    frames_base: u64,
-    fps_now: f32,
-    size_bytes: u64,
-    sys_db: Option<f32>,
-    mic_db: Option<f32>,
-    err_tail: String, // last stderr lines — real ffmpeg diagnostics
+/// One live native capture session (exactly one monitor) plus its file.
+struct LiveSeg {
+    session: crate::nativerec::NativeSession,
+    path: PathBuf,
+    monitor_idx: usize,
 }
 
-// ---------------------------------------------------------------------------
-// Recorder state
-// ---------------------------------------------------------------------------
+/// Finished segment files, grouped per rotation (one entry per monitor).
+#[derive(Clone)]
+struct SegSet {
+    files: Vec<(usize, PathBuf)>,
+    finished_at: std::time::SystemTime,
+}
 
 struct ActiveRec {
-    child: Option<tokio::process::Child>,
-    partials: Vec<PathBuf>,
+    /// Live sessions (1 normally; N for all-screens).
+    segs: Vec<LiveSeg>,
+    /// Finished parts awaiting the stop-time merge.
+    parts: Vec<SegSet>,
+    pump: Option<crate::audio::PcmPump>,
     workdir: PathBuf,
     active_ms: u64,
     active_start: Option<Instant>,
     params: Params,
-    live: Arc<StdMutex<LiveStats>>,
     final_name: String,
+    base_frames: u64,
+    /// Captured (pushed) frames at finalize, for duplicate accounting.
+    final_frames: u64,
+    /// Watchdog already reported an unexpected capture death (report once).
+    watch_noted: bool,
 }
 
 struct ActiveReplay {
-    child: Option<tokio::process::Child>,
+    /// Currently-open segment set (multi-monitor fan-out).
+    segs: Vec<LiveSeg>,
+    pump: Option<crate::audio::PcmPump>,
+    /// Closed segment sets (rolling window pruned by mtime).
+    closed: Vec<SegSet>,
     segdir: PathBuf,
     started_at: Instant,
     duration_s: u64,
     params: Params,
-    live: Arc<StdMutex<LiveStats>>,
-    stop_flag: Arc<AtomicBool>,
     supervisor: Option<tokio::task::JoinHandle<()>>,
+    /// Watchdog already reported an unexpected buffer death (report once).
+    watch_noted: bool,
 }
 
 pub struct Recorder {
     rec: Option<ActiveRec>,
     replay: Option<ActiveReplay>,
+    /// True while a replay save is finalizing (state "saving").
+    replay_saving: bool,
     rec_icon: Option<(Vec<u8>, u32, u32)>,
     timer_gen: Arc<AtomicU64>,
     timer_handle: Option<tokio::task::AbortHandle>,
     last_message: String,
+    /// Set by the overlay (Esc) to abort a pending on-screen countdown.
+    pub countdown_cancel: Arc<AtomicBool>,
 }
 
 impl Recorder {
@@ -711,31 +600,34 @@ impl Recorder {
         Self {
             rec: None,
             replay: None,
+            replay_saving: false,
             rec_icon: None,
             timer_gen: Arc::new(AtomicU64::new(0)),
             timer_handle: None,
             last_message: String::new(),
+            countdown_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn is_recording(&self) -> bool {
-        self.rec.as_ref().map(|r| r.child.is_some()).unwrap_or(false)
+        self.rec.as_ref().map(|r| !r.segs.is_empty()).unwrap_or(false)
     }
 
     pub fn is_paused(&self) -> bool {
         match &self.rec {
-            Some(r) => r.child.is_none(),
+            Some(r) => r.segs.is_empty(),
             None => false,
         }
     }
 
     pub fn replay_state(&self) -> &'static str {
+        if self.replay_saving {
+            return "saving";
+        }
         match &self.replay {
             None => "off",
             Some(r) => {
-                if r.child.is_none() {
-                    "saving"
-                } else if r.started_at.elapsed().as_secs() < 3 {
+                if r.started_at.elapsed().as_secs() < 3 {
                     "starting"
                 } else {
                     "ready"
@@ -766,14 +658,19 @@ pub struct RecStatus {
     pub elapsed_s: u64,
     pub frames: u64,
     pub fps: u32,
+    pub actual_fps: f32,
     pub width: u32,
     pub height: u32,
     pub encoder: String,
     pub encoder_label: String,
+    pub capture_api: String,
     pub size_bytes: u64,
     pub dropped: u64,
+    pub duplicated: u64,
     pub sys_db: Option<f32>,
     pub mic_db: Option<f32>,
+    pub audio_status: String,
+    pub perf_warning: Option<String>,
     pub message: String,
     pub ffmpeg: bool,
     pub ffmpeg_path: Option<String>,
@@ -784,19 +681,86 @@ pub(crate) fn snapshot(rec: &Recorder) -> RecStatus {
     status_of(rec)
 }
 
-fn status_of(rec: &Recorder) -> RecStatus {    let ff = ffmpeg_path();
+fn audio_status_text(audio: &str, sys_db: Option<f32>, mic_db: Option<f32>) -> String {
+    match audio {
+        "both" => format!(
+            "sys {} Â· mic {}",
+            if sys_db.is_some() { "on" } else { "silent" },
+            if mic_db.is_some() { "on" } else { "silent" }
+        ),
+        "system" => {
+            if sys_db.is_some() {
+                "system on".to_string()
+            } else {
+                "system silent".to_string()
+            }
+        }
+        "mic" | "microphone" => {
+            if mic_db.is_some() {
+                "mic on".to_string()
+            } else {
+                "mic silent".to_string()
+            }
+        }
+        _ => "no audio".to_string(),
+    }
+}
+
+fn perf_warning(target_fps: u32, actual: f32, elapsed_s: u64) -> Option<String> {
+    if elapsed_s < 5 || target_fps == 0 {
+        return None;
+    }
+    if actual > 0.0 && actual < target_fps as f32 * 0.85 {
+        Some(format!(
+            "Recording performance is below target (actual ~{actual:.0} vs {target_fps} FPS). Consider lowering quality or FPS."
+        ))
+    } else {
+        None
+    }
+}
+
+fn live_frames(segs: &[LiveSeg]) -> u64 {
+    segs.iter()
+        .map(|s| s.session.frames.load(Ordering::SeqCst))
+        .sum()
+}
+
+fn parts_bytes(parts: &[SegSet]) -> u64 {
+    parts
+        .iter()
+        .flat_map(|s| s.files.iter())
+        .filter_map(|(_, p)| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum()
+}
+
+fn status_of(rec: &Recorder) -> RecStatus {
     if let Some(r) = &rec.rec {
-        let live = r.live.lock().map(|l| l.clone()).unwrap_or_default();
         let mut elapsed_ms = r.active_ms;
         if let Some(t) = r.active_start {
             elapsed_ms += t.elapsed().as_millis() as u64;
         }
         let elapsed_s = elapsed_ms / 1000;
-        let frames = live.frames_base + live.frames;
+        let frames = r.base_frames + live_frames(&r.segs);
+        // Honest wall-clock shortfall (expected - delivered). `actual` is
+        // MEASURED frames/second â€” never a metadata tag.
         let dropped = (elapsed_s * r.params.fps as u64).saturating_sub(frames);
+        let (sys_db, mic_db) = match &r.pump {
+            Some(p) => (p.sys_db(), p.mic_db()),
+            None => (None, None),
+        };
+        let actual = if elapsed_s > 0 {
+            frames as f32 / elapsed_s as f32
+        } else {
+            0.0
+        };
+        // Current part sizes (cheap metadata reads on the 1s tick).
+        let mut size_bytes = parts_bytes(&r.parts);
+        for s in &r.segs {
+            size_bytes += std::fs::metadata(&s.path).map(|m| m.len()).unwrap_or(0);
+        }
         return RecStatus {
-            recording: r.child.is_some(),
-            paused: r.child.is_none(),
+            recording: !r.segs.is_empty(),
+            paused: r.segs.is_empty(),
             replay: rec.replay_state().to_string(),
             replay_ready_s: rec
                 .replay
@@ -807,42 +771,62 @@ fn status_of(rec: &Recorder) -> RecStatus {    let ff = ffmpeg_path();
             elapsed_s,
             frames,
             fps: r.params.fps,
+            actual_fps: actual,
             width: r.params.out_w,
             height: r.params.out_h,
-            encoder: r.params.encoder.clone(),
+            encoder: r.params.codec.to_uppercase(),
             encoder_label: r.params.encoder_label.clone(),
-            size_bytes: live.size_bytes,
+            capture_api: NATIVE_CAPTURE_API.to_string(),
+            size_bytes,
             dropped,
-            sys_db: live.sys_db,
-            mic_db: live.mic_db,
+            duplicated: 0,
+            sys_db,
+            mic_db,
+            audio_status: audio_status_text(&r.params.audio, sys_db, mic_db),
+            perf_warning: perf_warning(r.params.fps, actual, elapsed_s),
             message: rec.last_message.clone(),
-            ffmpeg: ff.is_some(),
-            ffmpeg_path: ff.map(|p| p.to_string_lossy().to_string()),
+            ffmpeg: true,
+            ffmpeg_path: None,
             power_note: r.params.power_note.clone(),
         };
     }
     if let Some(rp) = &rec.replay {
-        let live = rp.live.lock().map(|l| l.clone()).unwrap_or_default();
+        let (sys_db, mic_db) = match &rp.pump {
+            Some(p) => (p.sys_db(), p.mic_db()),
+            None => (None, None),
+        };
+        let frames = live_frames(&rp.segs);
+        let ready_s = rp.started_at.elapsed().as_secs();
+        let actual = if ready_s > 0 {
+            frames as f32 / ready_s as f32
+        } else {
+            0.0
+        };
         return RecStatus {
             recording: false,
             paused: false,
             replay: rec.replay_state().to_string(),
-            replay_ready_s: rp.started_at.elapsed().as_secs(),
+            replay_ready_s: ready_s,
             replay_duration: rp.duration_s,
             elapsed_s: 0,
-            frames: live.frames_base + live.frames,
+            frames,
             fps: rp.params.fps,
+            actual_fps: actual,
             width: rp.params.out_w,
             height: rp.params.out_h,
-            encoder: rp.params.encoder.clone(),
+            encoder: rp.params.codec.to_uppercase(),
             encoder_label: rp.params.encoder_label.clone(),
-            size_bytes: live.size_bytes,
-            dropped: 0,
-            sys_db: live.sys_db,
-            mic_db: live.mic_db,
+            capture_api: NATIVE_CAPTURE_API.to_string(),
+            size_bytes: parts_bytes(&rp.closed),
+            dropped: (ready_s * rp.params.fps as u64).saturating_sub(frames),
+            duplicated: 0,
+            sys_db,
+            mic_db,
+            audio_status: audio_status_text(&rp.params.audio, sys_db, mic_db),
+            perf_warning: None,
             message: rec.last_message.clone(),
-            ffmpeg: ff.is_some(),
-            ffmpeg_path: ff.map(|p| p.to_string_lossy().to_string()),
+            ffmpeg: true,
+            ffmpeg_path: None,
             power_note: None,
         };
     }
@@ -855,442 +839,72 @@ fn status_of(rec: &Recorder) -> RecStatus {    let ff = ffmpeg_path();
         elapsed_s: 0,
         frames: 0,
         fps: 0,
+        actual_fps: 0.0,
         width: 0,
         height: 0,
         encoder: String::new(),
         encoder_label: String::new(),
+        capture_api: String::new(),
         size_bytes: 0,
         dropped: 0,
+        duplicated: 0,
         sys_db: None,
         mic_db: None,
+        audio_status: "idle".to_string(),
+        perf_warning: None,
         message: rec.last_message.clone(),
-        ffmpeg: ff.is_some(),
-        ffmpeg_path: ff.map(|p| p.to_string_lossy().to_string()),
+        ffmpeg: true,
+        ffmpeg_path: None,
         power_note: None,
     }
 }
 
 // ---------------------------------------------------------------------------
-// ffmpeg command building
+// Native sessions (WGC + Media Foundation). No subprocesses, no pipes, no
+// progress scraping: frames, audio and stats flow through Rust types.
 // ---------------------------------------------------------------------------
 
-struct BuiltCmd {
-    args: Vec<String>,
-    has_sys: bool,
-    has_mic: bool,
+
+
+
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaInfo {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f32,
+    pub container_fps: f32,
+    pub video_samples: u64,
+    pub codec: String,
+    pub audio_codec: String,
+    pub sample_rate: u32,
+    pub duration_sec: f64,
 }
 
-fn build_cmd(ff: &Path, p: &Params, out: &Path, segment_time: Option<u64>) -> BuiltCmd {
-    let mut a: Vec<String> = vec![
-        "-y".into(),
-        "-hide_banner".into(),
-        "-loglevel".into(),
-        "warning".into(),
-    ];
-    // Video input.
-    a.extend([
-        "-f".into(),
-        "gdigrab".into(),
-        "-framerate".into(),
-        p.fps.to_string(),
-        "-draw_mouse".into(),
-        if p.cursor { "1".into() } else { "0".into() },
-    ]);
-    let all_desktop = p.desktop;
-    if !all_desktop {
-        a.extend([
-            "-offset_x".into(),
-            p.area.x.to_string(),
-            "-offset_y".into(),
-            p.area.y.to_string(),
-            "-video_size".into(),
-            format!("{}x{}", p.area.w, p.area.h),
-        ]);
-    }
-    a.extend(["-i".into(), "desktop".into()]);
-    // Audio inputs.
-    let mut audio_inputs: Vec<(&str, String)> = vec![]; // (kind, device)
-    if p.audio == "mic" || p.audio == "both" {
-        if let Some(m) = &p.mic {
-            audio_inputs.push(("mic", m.clone()));
-        }
-    }
-    if p.audio == "system" || p.audio == "both" {
-        if let Some(s) = &p.sys {
-            audio_inputs.push(("sys", s.clone()));
-        }
-    }
-    for (_, dev) in &audio_inputs {
-        a.extend([
-            "-rtbufsize".into(),
-            "50M".into(),
-            "-f".into(),
-            "dshow".into(),
-            "-i".into(),
-            format!("audio=\"{dev}\""),
-        ]);
-    }
-    let has_sys = audio_inputs.iter().any(|(k, _)| *k == "sys");
-    let has_mic = audio_inputs.iter().any(|(k, _)| *k == "mic");
-    // Filter graph.
-    let need_scale = p.out_w != p.area.w || p.out_h != p.area.h;
-    if audio_inputs.is_empty() {
-        if need_scale {
-            a.extend([
-                "-vf".into(),
-                format!("scale={}:{}", p.out_w, p.out_h),
-            ]);
-        }
-        a.push("-an".into());
-    } else {
-        // [0:v] scale + per-source ebur128 meters + amix when both.
-        let mut g = String::new();
-        if need_scale {
-            g.push_str(&format!("[0:v]scale={}:{}[vout];", p.out_w, p.out_h));
-        }
-        // audio input indexes: desktop=0, then each dshow input in order
-        let mut labels: Vec<String> = vec![];
-        for (i, (kind, _)) in audio_inputs.iter().enumerate() {
-            let idx = i + 1;
-            let tag = if *kind == "sys" { "sys" } else { "mic" };
-            g.push_str(&format!("[{idx}:a]ebur128=peak=true[{tag}];"));
-            labels.push(tag.to_string());
-        }
-        let amap = if labels.len() > 1 {
-            g.push_str("[sys][mic]amix=inputs=2:duration=longest:dropout_transition=0[aout];");
-            "[aout]".to_string()
-        } else {
-            format!("[{}]", labels[0])
-        };
-        // strip trailing ';'
-        if g.ends_with(';') {
-            g.pop();
-        }
-        a.extend(["-filter_complex".into(), g]);
-        if need_scale {
-            a.extend(["-map".into(), "[vout]".into()]);
-        } else {
-            a.extend(["-map".into(), "0:v".into()]);
-        }
-        a.extend(["-map".into(), amap]);
-        a.extend([
-            "-ar".into(),
-            p.sample_rate.to_string(),
-            "-ac".into(),
-            p.channels.to_string(),
-            "-c:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            "128k".into(),
-        ]);
-    }
-    // Video encode.
-    a.extend([
-        "-c:v".into(),
-        p.encoder.clone(),
-        "-b:v".into(),
-        format!("{}k", p.bitrate_k),
-        "-pix_fmt".into(),
-        "yuv420p".into(),
-    ]);
-    if p.encoder == "libx264" || p.encoder == "libx265" {
-        a.extend(["-preset".into(), "veryfast".into()]);
-    }
-    a.extend(["-r".into(), p.fps.to_string()]);
-    a.extend(["-progress".into(), "pipe:1".into(), "-nostats".into()]);
-    // Output.
-    if let Some(seg) = segment_time {
-        a.extend([
-            "-f".into(),
-            "segment".into(),
-            "-segment_time".into(),
-            seg.to_string(),
-            "-segment_format".into(),
-            "mp4".into(),
-            out.to_string_lossy().to_string(),
-        ]);
-    } else {
-        a.extend([
-            "-movflags".into(),
-            "+faststart".into(),
-            out.to_string_lossy().to_string(),
-        ]);
-    }
-    let _ = ff;
-    BuiltCmd { args: a, has_sys, has_mic }
-}
-
-// ---------------------------------------------------------------------------
-// Process helpers
-// ---------------------------------------------------------------------------
-
-async fn spawn_ffmpeg(ff: &Path, args: Vec<String>) -> Result<tokio::process::Child, String> {
-    crate::procutil::tokio_cmd(ff)
-        .args(&args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("Unable to start screen recording. ({e})"))
-}
-
-fn spawn_readers(
-    child: &mut tokio::process::Child,
-    live: Arc<StdMutex<LiveStats>>,
-    has_sys: bool,
-    has_mic: bool,
-) -> Vec<tokio::task::JoinHandle<()>> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    let mut handles = vec![];
-    if let Some(out) = child.stdout.take() {
-        let live = live.clone();
-        handles.push(tokio::spawn(async move {
-            let mut lines = BufReader::new(out).lines();
-            let mut key = String::new();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let line = line.trim().to_string();
-                if line.is_empty() || line == "." {
-                    continue;
-                }
-                if let Some((k, v)) = line.split_once('=') {
-                    key = k.trim().to_string();
-                    let v = v.trim();
-                    if let Ok(mut l) = live.lock() {
-                        match key.as_str() {
-                            "frame" => {
-                                l.frames = v.parse().unwrap_or(l.frames);
-                            }
-                            "fps" => {
-                                l.fps_now = v.parse().unwrap_or(l.fps_now);
-                            }
-                            "total_size" => {
-                                l.size_bytes = v.parse().unwrap_or(l.size_bytes);
-                            }
-                            _ => {}
-                        }
-                    }
-                } else {
-                    let _ = &key;
-                }
-            }
-        }));
-    }
-    if let Some(err) = child.stderr.take() {
-        let live = live.clone();
-        handles.push(tokio::spawn(async move {
-            let mut lines = BufReader::new(err).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                // Keep a capped tail of stderr: real diagnostics on failure.
-                if let Ok(mut l) = live.lock() {
-                    l.err_tail.push_str(&line);
-                    l.err_tail.push('\n');
-                    const CAP: usize = 3000;
-                    if l.err_tail.len() > CAP {
-                        l.err_tail = l.err_tail[l.err_tail.len() - CAP..].to_string();
-                    }
-                }
-                // ebur128 loudness: [Parsed_ebur128_0 @ ...] M: -23.4 S: ...
-                if line.contains("ebur128_") {
-                    let idx = if line.contains("ebur128_1") { 1 } else { 0 };
-                    if let Some(pos) = line.find("M:") {
-                        let num: String = line[pos + 2..]
-                            .chars()
-                            .take_while(|c| c.is_numeric() || *c == '.' || *c == '-')
-                            .collect();
-                        if let Ok(db) = num.parse::<f32>() {
-                            if let Ok(mut l) = live.lock() {
-                                // filter order: sys first when both present
-                                let is_sys = if has_sys && has_mic {
-                                    idx == 0
-                                } else {
-                                    has_sys
-                                };
-                                if is_sys {
-                                    l.sys_db = Some(db);
-                                } else {
-                                    l.mic_db = Some(db);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }));
-    }
-    handles
-}
-
-/// ffmpeg's own words about a failure (last ~400 chars of stderr).
-fn short_tail(live: &Arc<StdMutex<LiveStats>>) -> String {
-    let tail = live
-        .lock()
-        .map(|l| l.err_tail.clone())
-        .unwrap_or_default();
-    let t = tail.trim();
-    if t.is_empty() {
-        return String::new();
-    }
-    t.chars()
-        .rev()
-        .take(400)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>()
-        .trim()
-        .to_string()
-}
-
-/// Did the child survive startup? Polls so dead-on-arrival processes
-/// (bad args / dead audio / unusable encoder) fail fast instead of waiting.
-async fn verify_alive(child: &mut tokio::process::Child, ms: u64) -> bool {
-    let mut waited = 0;
-    while waited < ms {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        waited += 200;
-        match child.try_wait() {
-            Ok(None) => continue,
-            _ => return false,
-        }
-    }
-    matches!(child.try_wait(), Ok(None))
-}
-
-struct Spawned {
-    child: tokio::process::Child,
-    live: Arc<StdMutex<LiveStats>>,
-}
-
-/// Spawn ffmpeg and VERIFY it actually runs, walking the encoder fallback
-/// chain (HW in probe order, software last). A listed-but-unusable encoder
-/// (e.g. NVENC without NVIDIA GPU) fails here and the next one is tried.
-/// Audio failures retry video-only. First success wins.
-async fn spawn_verified(
-    ff: &Path,
-    probe: &Probe,
-    params: &mut Params,
-    out: &Path,
-    segment: Option<u64>,
-    reuse_live: Option<Arc<StdMutex<LiveStats>>>,
-) -> Result<Spawned, String> {
-    let chain = encoder_chain(probe, &params.codec);
-    let orig_audio = params.audio.clone();
-    let orig_mic = params.mic.clone();
-    let orig_sys = params.sys.clone();
-    let mut last_err = String::new();
-    for cand in &chain {
-        params.encoder = cand.name.clone();
-        params.encoder_label = cand.label.clone();
-        for attempt in 0..2 {
-            if attempt == 0 || orig_audio == "none" {
-                params.audio = orig_audio.clone();
-                params.mic = orig_mic.clone();
-                params.sys = orig_sys.clone();
-                if attempt > 0 {
-                    break; // no second attempt when audio was never requested
-                }
-            } else {
-                params.audio = "none".to_string();
-                params.mic = None;
-                params.sys = None;
-            }
-            let cmd = build_cmd(ff, params, out, segment);
-            let mut child = spawn_ffmpeg(ff, cmd.args.clone()).await?;
-            let live = reuse_live
-                .clone()
-                .unwrap_or_else(|| Arc::new(StdMutex::new(LiveStats::default())));
-            let _readers =
-                spawn_readers(&mut child, live.clone(), cmd.has_sys, cmd.has_mic);
-            if verify_alive(&mut child, if segment.is_some() { 2000 } else { 1500 }).await {
-                return Ok(Spawned { child, live });
-            }
-            let tail = short_tail(&live);
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            last_err = tail.clone();
-            // Route the failure: broken VIDEO encoder -> next encoder now
-            // (audio retry would just waste time); otherwise retry video-only.
-            let tl = tail.to_lowercase();
-            let video_broken = tl.contains("could not open encoder")
-                || tl.contains("error initializing output stream 0:0")
-                || tl.contains("no nvenc")
-                || tl.contains("nvenc");
-            if video_broken || orig_audio == "none" {
-                break;
-            }
-        }
-    }
-    let detail = if last_err.is_empty() {
-        String::new()
-    } else {
-        format!(" ({last_err})")
+/// REAL file verification from the container itself (pure-Rust MP4 parser â€”
+/// no external prober). Reads dims, container fps (samples/duration),
+/// codecs and duration: never the requested settings.
+pub fn verify_media(path: &Path) -> MediaInfo {
+    let mut info = MediaInfo::default();
+    let parsed = match crate::mp4info::read_info(path) {
+        Ok(i) => i,
+        Err(_) => return info,
     };
-    Err(format!("Unable to start screen recording.{detail}"))
-}
-
-/// Ask ffmpeg to finish cleanly ('q'), else kill.
-async fn quit_child(child: &mut tokio::process::Child) {
-    use tokio::io::AsyncWriteExt;
-    if let Some(stdin) = child.stdin.as_mut() {
-        let _ = stdin.write_all(b"q").await;
-        let _ = stdin.flush().await;
+    info.duration_sec = parsed.duration_sec;
+    if let Some(v) = parsed.video.as_ref() {
+        info.width = v.width;
+        info.height = v.height;
+        info.video_samples = v.samples as u64;
+        info.codec = v.codec.clone();
+        info.fps = crate::mp4info::container_fps(&parsed) as f32;
+        info.container_fps = info.fps;
     }
-    match tokio::time::timeout(Duration::from_secs(8), child.wait()).await {
-        Ok(_) => {}
-        Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
+    if let Some(a) = parsed.audio {
+        info.audio_codec = a.codec;
+        info.sample_rate = a.timescale;
     }
-}
-
-async fn concat_copy(ff: &Path, files: &[PathBuf], out: &Path) -> Result<(), String> {
-    if files.is_empty() {
-        return Err("Nothing was recorded.".to_string());
-    }
-    if files.len() == 1 {
-        if std::fs::rename(&files[0], out).is_err() {
-            std::fs::copy(&files[0], out).map_err(|e| e.to_string())?;
-            let _ = std::fs::remove_file(&files[0]);
-        }
-        return Ok(());
-    }
-    let list_path = out.with_extension("filelist.txt");
-    let mut list = String::new();
-    for f in files {
-        list.push_str(&format!("file '{}'\n", f.to_string_lossy().replace('\'', "'\\''")));
-    }
-    std::fs::write(&list_path, list).map_err(|e| e.to_string())?;
-    let st = crate::procutil::tokio_cmd(ff)
-        .args([
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            &list_path.to_string_lossy(),
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            &out.to_string_lossy(),
-        ])
-        .status()
-        .await
-        .map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&list_path);
-    if !st.success() {
-        return Err("Could not finalize the recording file.".to_string());
-    }
-    for f in files {
-        let _ = std::fs::remove_file(f);
-    }
-    Ok(())
+    info
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,14 +939,14 @@ fn drive_free_bytes(path: &Path) -> Option<u64> {
 fn check_disk(path: &Path, need_bytes: u64) -> Result<(), String> {
     if let Some(free) = drive_free_bytes(path) {
         if free < need_bytes {
-            return Err("Not enough disk space to save this recording. Free up space and try again. / لا توجد مساحة كافية لحفظ التسجيل.".to_string());
+            return Err("Not enough disk space to save this recording. Free up space and try again. / Ù„Ø§ ØªÙˆØ¬Ø¯ Ù…Ø³Ø§Ø­Ø© ÙƒØ§ÙÙŠØ© Ù„Ø­ÙØ¸ Ø§Ù„ØªØ³Ø¬ÙŠÙ„.".to_string());
         }
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Recording history (metadata only — videos never loaded to RAM)
+// Recording history (metadata only â€” videos never loaded to RAM)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1450,6 +1064,124 @@ fn temp_workdir(prefix: &str) -> PathBuf {
     d
 }
 
+fn hw_mode_setting() -> String {
+    match crate::settings::load_settings().rec_hw_mode.as_str() {
+        "hw" => "hw".to_string(),
+        "sw" => "sw".to_string(),
+        _ => "auto".to_string(),
+    }
+}
+
+/// One monitor's share of a recording: full monitor or a clamped crop box
+/// (monitor-relative physical pixels) with aspect-fit output (never upscale).
+struct NativeTarget {
+    monitor_idx: usize,
+    crop: Option<(u32, u32, u32, u32)>,
+    out_w: u32,
+    out_h: u32,
+}
+
+fn resolve_targets(area: &Area, out_w: u32, out_h: u32) -> Result<Vec<NativeTarget>, String> {
+    let mons = crate::screenshot::list_monitors().map_err(|e| e.to_string())?;
+    if mons.is_empty() {
+        return Err("No monitors found".to_string());
+    }
+    let all = is_full_virtual(area);
+    let mut out = vec![];
+    for (i, m) in mons.iter().enumerate() {
+        let ix0 = area.x.max(m.x);
+        let iy0 = area.y.max(m.y);
+        let ix1 = (area.x + area.w as i32).min(m.x + m.width as i32);
+        let iy1 = (area.y + area.h as i32).min(m.y + m.height as i32);
+        if ix1 <= ix0 || iy1 <= iy0 {
+            continue;
+        }
+        let mw = m.width;
+        let mh = m.height;
+        if all || (ix0 == m.x && iy0 == m.y && (ix1 - ix0) as u32 == mw && (iy1 - iy0) as u32 == mh) {
+            // Whole monitor at source geometry â€” zero-copy DirectX path.
+            out.push(NativeTarget { monitor_idx: i, crop: None, out_w: mw, out_h: mh });
+            continue;
+        }
+        let cw = (ix1 - ix0) as u32;
+        let ch = (iy1 - iy0) as u32;
+        let k = ((out_w as f64 / cw.max(1) as f64).min(out_h as f64 / ch.max(1) as f64)).min(1.0);
+        let ow = even((cw as f64 * k).round() as u32).max(64);
+        let oh = even((ch as f64 * k).round() as u32).max(64);
+        out.push(NativeTarget {
+            monitor_idx: i,
+            crop: Some(((ix0 - m.x) as u32, (iy0 - m.y) as u32, (ix1 - m.x) as u32, (iy1 - m.y) as u32)),
+            out_w: ow,
+            out_h: oh,
+        });
+    }
+    if out.is_empty() {
+        return Err("Selected area is outside all monitors".to_string());
+    }
+    Ok(out)
+}
+
+fn native_cfg(params: &Params, t: &NativeTarget) -> crate::nativerec::NativeRecConfig {
+    crate::nativerec::NativeRecConfig {
+        monitor_idx: t.monitor_idx,
+        crop: t.crop,
+        out_w: t.out_w,
+        out_h: t.out_h,
+        fps: params.fps,
+        bitrate_bps: params.bitrate_bps,
+        codec: if params.codec == "hevc" {
+            crate::nativerec::NativeCodec::Hevc
+        } else {
+            crate::nativerec::NativeCodec::H264
+        },
+        cursor: params.cursor,
+        audio_channels: if params.audio == "none" { 0 } else { params.channels },
+        sample_rate: params.sample_rate,
+    }
+}
+
+struct FinishedSeg {
+    monitor_idx: usize,
+    path: PathBuf,
+    frames: u64,
+    audio_bytes: u64,
+    error: Option<String>,
+}
+
+/// Blocking: stop sessions, finalize their MP4s, report encoder-confirmed
+/// frame counts + pushed audio bytes. Always call via `spawn_blocking`
+/// (joins OS threads).
+fn finish_segs(segs: Vec<LiveSeg>) -> Vec<FinishedSeg> {
+    segs.into_iter()
+        .map(|s| {
+            let approx = s.session.frames.load(Ordering::SeqCst);
+            let err_arc = s.session.error.clone();
+            match s.session.stop_and_join() {
+                Ok(st) => FinishedSeg {
+                    monitor_idx: s.monitor_idx,
+                    path: s.path,
+                    frames: st.frames,
+                    audio_bytes: st.audio_bytes,
+                    error: err_arc.lock().ok().and_then(|mut e| e.take()),
+                },
+                Err(e) => FinishedSeg {
+                    monitor_idx: s.monitor_idx,
+                    path: s.path,
+                    frames: approx,
+                    audio_bytes: 0,
+                    error: Some(e),
+                },
+            }
+        })
+        .collect()
+}
+
+/// A finished part file worth merging (drops empty/corrupt stubs from
+/// instant pauses so the remuxer never chokes).
+fn valid_part(p: &Path) -> bool {
+    std::fs::metadata(p).map(|m| m.len() > 4096).unwrap_or(false)
+}
+
 impl Recorder {
     fn note(&mut self, m: &str) {
         self.last_message = m.to_string();
@@ -1475,7 +1207,44 @@ impl Recorder {
                     break;
                 }
                 let (tip, active) = {
-                    let rec = shared_c.lock().await;
+                    let mut rec = shared_c.lock().await;
+                    // Watchdog: a native session thread died on its own
+                    // (monitor unplugged, driver crash, encoder blew up).
+                    // Say so NOW â€” a silent truncated file is the worst UX.
+                    // Sessions that the user stopped/paused are already gone
+                    // from `segs`, so anything finished here is unexpected.
+                    let mut died: Option<String> = None;
+                    if let Some(r) = rec.rec.as_mut() {
+                        if !r.watch_noted {
+                            for s in &r.segs {
+                                if s.session.is_finished() {
+                                    if let Some(e) = s.session.take_error() {
+                                        r.watch_noted = true;
+                                        died = Some(format!("Screen capture stopped unexpectedly ({e}). Press Stop to finalize what was recorded."));
+                                        break;
+                                    }
+                                    r.watch_noted = true;
+                                    died = Some("Screen capture stopped unexpectedly. Press Stop to finalize what was recorded.".to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(rp) = rec.replay.as_mut() {
+                        if !rp.watch_noted {
+                            for s in &rp.segs {
+                                if s.session.is_finished() {
+                                    rp.watch_noted = true;
+                                    died = Some("Replay buffer stopped unexpectedly. Restart Instant Replay.".to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(m) = died {
+                        rec.last_message = m;
+                        crate::rebuild_tray(&app_h, &status_of(&rec));
+                    }
                     (tooltip_text(&rec), rec.rec.is_some() || rec.replay.is_some())
                 };
                 if !active {
@@ -1490,6 +1259,8 @@ impl Recorder {
     }
 
     /// Start a normal recording of `area` (already normalized virtual coords).
+    /// Native pipeline: WGC sessions (one per monitor) + WASAPI pump, all
+    /// started in the same instant; smooth start absorbs first-frame warmup.
     pub async fn start_recording(
         &mut self,
         shared: Shared,
@@ -1500,292 +1271,393 @@ impl Recorder {
             return Err("Already recording.".to_string());
         }
         let s = settings::load_settings();
-        let ff = ffmpeg_path().ok_or_else(|| {
-            "Recorder engine (ffmpeg) is missing. Open Settings → Recording and download it once. / محرك التسجيل غير موجود.".to_string()
-        })?;
         let folder = default_folder(&s);
         std::fs::create_dir_all(&folder).map_err(|_| {
-            "Unable to create the recording folder. Choose another folder in Settings. / تعذّر إنشاء مجلد التسجيل.".to_string()
+            "Unable to create the recording folder. Choose another folder in Settings. / ØªØ¹Ø°Ù‘Ø± Ø¥Ù†Ø´Ø§Ø¡ Ù…Ø¬Ù„Ø¯ Ø§Ù„ØªØ³Ø¬ÙŠÙ„.".to_string()
         })?;
         check_disk(&folder, 1024 * 1024 * 1024)?; // 1 GB for open-ended recording
         let probe = get_probe(false)?;
-        let mut params = resolve_params(&s, &probe, area.clone(), false);
-        params.desktop = is_full_virtual(&params.area);
-        if params.audio != "none" && params.mic.is_none() && params.sys.is_none() {
-            // Audio requested but no device: keep video, say so (don't fail video).
-            params.audio = "none".to_string();
-            self.note("Audio capture is unavailable — recording video only.");
+        let params = resolve_params(&s, &probe, area.clone(), false)?;
+        if let Some(n) = &params.codec_note {
+            self.note(n);
         }
-        let workdir = temp_workdir("openscreen-rec");
-        let part = workdir.join("part001.mp4");
-        let wanted_audio = params.audio.clone();
-        let cands = encoder_chain(&probe, &params.codec);
-        let first_name = cands[0].name.clone();
-        let first_label = cands[0].label.clone();
-        let spawned = spawn_verified(&ff, &probe, &mut params, &part, None, None)
-            .await
-            .map_err(|e| {
-                self.note(&e);
-                e
-            })?;
-        if params.encoder != first_name {
-            if params.encoder == "libx264" || params.encoder == "libx265" {
-                self.note("Hardware encoder unavailable. Using software encoding.");
-            } else {
-                self.note(&format!(
-                    "{first_label} unavailable. Using {}.",
-                    params.encoder_label
-                ));
+        if let Some(n) = &params.audio_note {
+            if self.last_message.is_empty() {
+                self.note(n);
             }
-        } else if wanted_audio != "none" && params.audio == "none" {
-            self.note("Audio capture failed — recording video only.");
         }
-        let Spawned { child, live } = spawned;
+        if !params.hw && s.rec_hw_mode != "sw" && self.last_message.is_empty() {
+            self.note("Hardware encoder unavailable. Using software encoding.");
+        }
+        let targets = resolve_targets(&params.area, params.out_w, params.out_h)?;
+        let workdir = temp_workdir("openscreen-rec");
+        dbg_pipe!(
+            "native rec backend={} area={}x{}@{},{} out={}x{}@{}fps codec={} ({}) bitrate={}k audio={} mic={:?} cursor={} targets={}",
+            NATIVE_CAPTURE_API,
+            params.area.w,
+            params.area.h,
+            params.area.x,
+            params.area.y,
+            params.out_w,
+            params.out_h,
+            params.fps,
+            params.codec,
+            params.encoder_label,
+            params.bitrate_k,
+            params.audio,
+            params.mic,
+            params.cursor,
+            targets.len(),
+        );
+        // Video sessions first (fast-fail before touching audio devices).
+        let mut segs = vec![];
+        for (i, t) in targets.iter().enumerate() {
+            let part = workdir.join(format!("part{:03}.mp4", i + 1));
+            let cfg = native_cfg(&params, t);
+            match crate::nativerec::start_session(cfg, part.clone()) {
+                Ok(session) => segs.push(LiveSeg {
+                    session,
+                    path: part,
+                    monitor_idx: t.monitor_idx,
+                }),
+                Err(e) => {
+                    // Tear down siblings; never leave half a recording.
+                    for s in segs.drain(..) {
+                        let _ = s.session.stop_and_join();
+                        let _ = std::fs::remove_file(&s.path);
+                    }
+                    let _ = std::fs::remove_dir_all(&workdir);
+                    self.note(&e);
+                    return Err(e);
+                }
+            }
+        }
+        // Audio pump fans out to every live session. Degraded audio never
+        // fails video â€” note once and continue silent.
+        let txs: Vec<_> = segs.iter().map(|sg| sg.session.audio_tx.clone()).collect();
+        let (pump, audio_note) = crate::audio::start_pcm_pump(
+            &params.audio,
+            params.mic.as_deref().unwrap_or(""),
+            params.sample_rate,
+            params.channels,
+            txs,
+        );
+        if let Some(n) = audio_note {
+            if self.last_message.is_empty() {
+                self.note(&n);
+            }
+        }
+        let pump_opt = if pump.is_active() { Some(pump) } else { None };
         self.rec = Some(ActiveRec {
-            child: Some(child),
-            partials: vec![],
+            segs,
+            parts: vec![],
+            pump: pump_opt,
             workdir,
             active_ms: 0,
             active_start: Some(Instant::now()),
             params: params.clone(),
-            live,
             final_name: final_name(false),
+            base_frames: 0,
+            final_frames: 0,
+            watch_noted: false,
         });
         self.start_timer(&shared, app);
         self.apply_tray(app);
         self.notify(
             app,
-            "Open Screen — Recording",
+            "Open Screen â€” Recording",
             "Recording started. Use the tray menu or Ctrl+Shift+R to stop.",
         );
-        if params.sw_fallback_note {
-            self.note("Hardware encoder unavailable. Using software encoding.");
-        }
         Ok(status_of(self))
     }
 
     pub async fn pause_recording(&mut self, app: &tauri::AppHandle) -> Result<RecStatus, String> {
-        let r = self.rec.as_mut().ok_or("Not recording.".to_string())?;
-        if r.child.is_none() {
-            return Err("Already paused.".to_string());
+        // Take live sessions out, finalize them off-thread, seal as a part.
+        let (segs, pump, workdir, params) = match self.rec.as_mut() {
+            Some(r) if !r.segs.is_empty() => (
+                std::mem::take(&mut r.segs),
+                r.pump.take(),
+                r.workdir.clone(),
+                r.params.clone(),
+            ),
+            Some(_) => return Err("Already paused.".to_string()),
+            None => return Err("Not recording.".to_string()),
+        };
+        let finished: Vec<FinishedSeg> =
+            tokio::task::spawn_blocking(move || finish_segs(segs))
+                .await
+                .map_err(|e| e.to_string())?;
+        if let Some(p) = pump {
+            p.stop_and_join();
         }
-        if let Some(mut child) = r.child.take() {
-            quit_child(&mut child).await;
+        let mut files = vec![];
+        let mut frames = 0u64;
+        for f in finished {
+            frames += f.frames;
+            if valid_part(&f.path) {
+                files.push((f.monitor_idx, f.path));
+            } else {
+                let _ = std::fs::remove_file(&f.path);
+            }
         }
-        // Seal current partial.
-        let idx = r.partials.len() + 1;
-        let sealed = r.workdir.join(format!("part{idx:03}.mp4"));
-        // The live partial was written to part001 path on first run; move it.
-        let live_path = r.workdir.join("part001.mp4");
-        if r.partials.is_empty() && live_path.exists() {
-            let _ = std::fs::rename(&live_path, &sealed);
-            r.partials.push(sealed);
-        }
-        if let Some(t) = r.active_start.take() {
-            r.active_ms += t.elapsed().as_millis() as u64;
-        }
-        if let Ok(mut l) = r.live.lock() {
-            l.frames_base += l.frames;
-            l.frames = 0;
+        let _ = (workdir, params);
+        if let Some(r) = self.rec.as_mut() {
+            if !files.is_empty() {
+                r.parts.push(SegSet {
+                    files,
+                    finished_at: std::time::SystemTime::now(),
+                });
+            }
+            r.base_frames += frames;
+            if let Some(t) = r.active_start.take() {
+                r.active_ms += t.elapsed().as_millis() as u64;
+            }
         }
         self.apply_tray(app);
         Ok(status_of(self))
     }
 
     pub async fn resume_recording(&mut self, app: &tauri::AppHandle) -> Result<RecStatus, String> {
-        let has = self.rec.as_ref().map(|r| r.child.is_some()).unwrap_or(false);
-        if !self.rec.is_some() {
-            return Err("Not recording.".to_string());
-        }
-        if has {
-            return Err("Already recording.".to_string());
-        }
-        let ff = ffmpeg_path().ok_or("Recorder engine missing.".to_string())?;
-        let (params, workdir, live, idx) = match &self.rec {
-            Some(r) => (
+        let (params, workdir, part_count) = match &self.rec {
+            Some(r) if r.segs.is_empty() => (
                 r.params.clone(),
                 r.workdir.clone(),
-                r.live.clone(),
-                r.partials.len() + 1,
+                r.parts.iter().map(|s| s.files.len()).sum::<usize>(),
             ),
+            Some(_) => return Err("Already recording.".to_string()),
             None => return Err("Not recording.".to_string()),
         };
-        // Next partial goes to a fresh file (never overwrite sealed ones).
-        let part = workdir.join(format!("live{idx:03}.mp4"));
-        let mut params = params;
-        let probe = get_probe(false)?;
-        let spawned = spawn_verified(&ff, &probe, &mut params, &part, None, Some(live.clone()))
-            .await
-            .map_err(|e| {
-                self.note(&e);
-                e
-            })?;
-        let Spawned { child, .. } = spawned;
+        let targets = resolve_targets(&params.area, params.out_w, params.out_h)?;
+        let mut segs = vec![];
+        for (i, t) in targets.iter().enumerate() {
+            let part = workdir.join(format!("resume{:03}_{i}.mp4", part_count + 1));
+            let cfg = native_cfg(&params, t);
+            match crate::nativerec::start_session(cfg, part.clone()) {
+                Ok(session) => segs.push(LiveSeg { session, path: part, monitor_idx: t.monitor_idx }),
+                Err(e) => {
+                    for s in segs.drain(..) {
+                        let _ = s.session.stop_and_join();
+                        let _ = std::fs::remove_file(&s.path);
+                    }
+                    self.note(&e);
+                    return Err(e);
+                }
+            }
+        }
+        let txs: Vec<_> = segs.iter().map(|sg| sg.session.audio_tx.clone()).collect();
+        let (pump, _) = crate::audio::start_pcm_pump(
+            &params.audio,
+            params.mic.as_deref().unwrap_or(""),
+            params.sample_rate,
+            params.channels,
+            txs,
+        );
+        let pump_opt = if pump.is_active() { Some(pump) } else { None };
         if let Some(r) = self.rec.as_mut() {
-            // Rename live file into sealed slot on next pause/stop.
-            r.child = Some(child);
+            r.segs = segs;
+            r.pump = pump_opt;
             r.active_start = Some(Instant::now());
-            // Track the live path via partials placeholder.
-            r.partials.push(part);
         }
         self.apply_tray(app);
         Ok(status_of(self))
     }
 
-    /// Stop recording, finalize file, history, post-action.
+    /// Stop recording: finish live segments (blocking finalize off-thread),
+    /// merge parts per monitor with stream copy, verify the real file,
+    /// history, post-action. Smooth stop order: video flush -> audio flush
+    /// -> remux -> verify -> save. Nothing recorded is ever deleted silently.
     pub async fn stop_recording(&mut self, app: &tauri::AppHandle) -> Result<RecStatus, String> {
         let mut r = self.rec.take().ok_or("Not recording.".to_string())?;
-        if let Some(mut child) = r.child.take() {
-            quit_child(&mut child).await;
+        if let Some(t) = r.active_start.take() {
+            r.active_ms += t.elapsed().as_millis() as u64;
         }
-        // Seal the live partial.
-        let live_candidates = [
-            r.workdir.join("part001.mp4"),
-            r.workdir.join(format!("live{:03}.mp4", r.partials.len())),
-        ];
-        for c in live_candidates {
-            if c.exists() && !r.partials.iter().any(|p| p == &c) {
-                r.partials.push(c);
-                break;
+        // 1) Finish live sessions (MP4 finalize happens here).
+        let live = std::mem::take(&mut r.segs);
+        let finished: Vec<FinishedSeg> = tokio::task::spawn_blocking(move || finish_segs(live))
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(pump) = r.pump.take() {
+            pump.stop_and_join();
+        }
+        let mut all_parts = r.parts;
+        if !finished.is_empty() {
+            let mut files = vec![];
+            let mut frames = 0u64;
+            let mut audio_bytes = 0u64;
+            for f in finished {
+                frames += f.frames;
+                audio_bytes += f.audio_bytes;
+                if let Some(e) = f.error {
+                    self.note(&format!("A segment ended early: {e}"));
+                }
+                if valid_part(&f.path) {
+                    files.push((f.monitor_idx, f.path));
+                } else {
+                    let _ = std::fs::remove_file(&f.path);
+                }
+            }
+            r.base_frames += frames;
+            // Honest audio claim (#67): configured but silent => say so.
+            if r.params.audio != "none" && audio_bytes == 0 {
+                self.note("No audio signal was captured â€” check the input device and volume.");
+            }
+            if !files.is_empty() {
+                all_parts.push(SegSet { files, finished_at: std::time::SystemTime::now() });
             }
         }
-        r.partials.retain(|p| p.exists());
-        // Drop empty/corrupt partials (e.g. paused instantly) so concat never chokes.
-        r.partials.retain(|p| {
-            let ok = std::fs::metadata(p).map(|m| m.len() > 4096).unwrap_or(false);
-            if !ok {
-                let _ = std::fs::remove_file(p);
+        r.final_frames = r.base_frames;
+        if let Some(t) = r.active_start.take() {
+            r.active_ms += t.elapsed().as_millis() as u64;
+        }
+        // Group finished parts per monitor, preserving order.
+        let mut per_mon: std::collections::BTreeMap<usize, Vec<PathBuf>> = Default::default();
+        for set in &all_parts {
+            for (mi, p) in &set.files {
+                per_mon.entry(*mi).or_default().push(p.clone());
             }
-            ok
+        }
+        per_mon.retain(|_, v| {
+            v.retain(|p| valid_part(p));
+            !v.is_empty()
         });
-        if r.partials.is_empty() {
+        if per_mon.is_empty() {
             let _ = std::fs::remove_dir_all(&r.workdir);
             self.stop_timer();
-            let tail = short_tail(&r.live);
-            let msg = if tail.is_empty() {
-                "Nothing was recorded.".to_string()
-            } else {
-                format!("Nothing was recorded. {tail}")
-            };
-            self.note(&msg);
+            self.note("Nothing was recorded.");
             self.apply_tray(app);
             return Ok(status_of(self));
         }
         let s = settings::load_settings();
         let folder = default_folder(&s);
         let _ = std::fs::create_dir_all(&folder);
-        let out = folder.join(&r.final_name);
-        // Estimate need: current temp size + margin.
-        let temp_size: u64 = r
-            .partials
-            .iter()
+        let temp_size: u64 = per_mon
+            .values()
+            .flatten()
             .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
             .sum();
         check_disk(&folder, temp_size + 100 * 1024 * 1024)?;
-        let ff = ffmpeg_path().ok_or("Recorder engine missing.".to_string())?;
-        concat_copy(&ff, &r.partials, &out)
-            .await
-            .map_err(|e| {
-                let _ = std::fs::remove_dir_all(&r.workdir);
+        // 2) Merge per monitor (stream copy, one timeline each). Multi-monitor
+        // recordings produce one honest file per screen.
+        let multi = per_mon.len() > 1;
+        let mut outs: Vec<(usize, PathBuf)> = vec![];
+        for (mi, files) in &per_mon {
+            let name = if multi {
+                let stem = r.final_name.trim_end_matches(".mp4");
+                format!("{stem}_S{}.mp4", mi + 1)
+            } else {
+                r.final_name.clone()
+            };
+            let out = folder.join(&name);
+            let workdir_str = r.workdir.to_string_lossy().to_string();
+            crate::mp4mux::remux_segments(files, &out).map_err(|e| {
+                self.note(&format!("Finalize failed â€” parts kept at {workdir_str}. {e}"));
                 e
             })?;
-        let _ = std::fs::remove_dir_all(&r.workdir);
-        let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
-        let mut elapsed_ms = r.active_ms;
-        if let Some(t) = r.active_start {
-            elapsed_ms += t.elapsed().as_millis() as u64;
+            outs.push((*mi, out));
         }
-        let item = RecHistoryItem {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: r.final_name.clone(),
-            path: out.to_string_lossy().to_string(),
-            created_at: chrono::Local::now().to_rfc3339(),
-            duration_s: elapsed_ms / 1000,
-            width: r.params.out_w,
-            height: r.params.out_h,
-            fps: r.params.fps,
-            size,
-            kind: "screen".to_string(),
-        };
-        rec_history_add(item, s.rec_history_limit);
+        let _ = std::fs::remove_dir_all(&r.workdir);
+        let elapsed_ms = r.active_ms;
+        // 3) REAL verification from the container (never the requested
+        // settings): dims, container fps, codecs, duration + duplicate math
+        // (container samples minus pushed frames).
+        for (mi, out) in &outs {
+            let size = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+            let (hist_w, hist_h, hist_fps, dups) = match crate::mp4info::read_info(out) {
+                Ok(info) => {
+                    let cfps = crate::mp4info::container_fps(&info).round() as u32;
+                    let (w, h, samples) = match info.video.as_ref() {
+                        Some(t) => (t.width, t.height, t.samples as u64),
+                        None => (r.params.out_w, r.params.out_h, 0),
+                    };
+                    let d = samples.saturating_sub(r.final_frames);
+                    if w != r.params.out_w || h != r.params.out_h {
+                        self.note(&format!("Saved at {w}x{h} (target {}x{}).", r.params.out_w, r.params.out_h));
+                    } else if (cfps as i32 - r.params.fps as i32).abs() > 5 {
+                        self.note(&format!(
+                            "Actual ~{cfps} FPS (target {} FPS). See Advanced performance.",
+                            r.params.fps
+                        ));
+                    }
+                    let _ = mi;
+                    (w, h, cfps, d)
+                }
+                Err(e) => {
+                    self.note(&format!("Saved file failed verification ({e})."));
+                    (r.params.out_w, r.params.out_h, r.params.fps, 0)
+                }
+            };
+            let _ = dups;
+            let name = out.file_name().and_then(|n| n.to_str()).unwrap_or(&r.final_name).to_string();
+            rec_history_add(
+                RecHistoryItem {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name,
+                    path: out.to_string_lossy().to_string(),
+                    created_at: chrono::Local::now().to_rfc3339(),
+                    duration_s: elapsed_ms / 1000,
+                    width: hist_w,
+                    height: hist_h,
+                    fps: hist_fps,
+                    size,
+                    kind: "screen".to_string(),
+                },
+                s.rec_history_limit,
+            );
+        }
         self.stop_timer();
         self.apply_tray(app);
-        self.notify(app, "Open Screen — Recording saved", &r.final_name);
-        apply_post_action(app, &s.rec_post_action, &out);
-        self.note("");
+        self.notify(app, "Open Screen â€” Recording saved", &r.final_name);
+        let first_out = outs.first().map(|(_, p)| p.clone()).unwrap_or_else(|| folder.join(&r.final_name));
+        apply_post_action(app, &s.rec_post_action, &first_out);
+        if self.last_message.is_empty() {
+            self.note("");
+        }
         Ok(status_of(self))
     }
 
     // -------------------------------------------------- Instant Replay ----
-    pub async fn replay_start(&mut self, app: &tauri::AppHandle) -> Result<RecStatus, String> {
+    // Native rolling buffer: sequential 10s MP4 segments (each starts with a
+    // keyframe) + ONE gapless WASAPI pump for the whole buffer lifetime.
+    // Save = rotate once (buffer keeps rolling) + stream-copy remux of the
+    // last N seconds. No countdown on save, no re-encode, no ffmpeg.
+    pub async fn replay_start(
+        &mut self,
+        shared: Shared,
+        app: &tauri::AppHandle,
+    ) -> Result<RecStatus, String> {
         if self.replay.is_some() {
             return Err("Instant Replay is already on.".to_string());
         }
         let s = settings::load_settings();
-        let ff = ffmpeg_path().ok_or_else(|| {
-            "Recorder engine (ffmpeg) is missing. Open Settings → Recording and download it once. / محرك التسجيل غير موجود.".to_string()
-        })?;
         let probe = get_probe(false)?;
-        // Replay captures the full virtual screen.
+        // Replay captures the full virtual screen (every monitor).
         let area = full_virtual_area();
-        let mut params = resolve_params(&s, &probe, area, true);
-        params.desktop = true; // replay always covers the full virtual screen
-        if params.audio != "none" && params.mic.is_none() && params.sys.is_none() {
-            params.audio = "none".to_string();
-            self.note("Audio capture is unavailable — replay video only.");
+        let params = resolve_params(&s, &probe, area, true)?;
+        if let Some(n) = &params.codec_note {
+            self.note(n);
+        }
+        if let Some(n) = &params.audio_note {
+            if self.last_message.is_empty() {
+                self.note(n);
+            }
         }
         let segdir = std::env::temp_dir().join("openscreen-replay");
         let _ = std::fs::remove_dir_all(&segdir);
         std::fs::create_dir_all(&segdir).map_err(|e| e.to_string())?;
         check_disk(&segdir, 512 * 1024 * 1024)?;
-        let pattern = segdir.join("seg%05d.mp4");
-        let wanted_audio = params.audio.clone();
-        let cands = encoder_chain(&probe, &params.codec);
-        let first_name = cands[0].name.clone();
-        let first_label = cands[0].label.clone();
-        let spawned = spawn_verified(&ff, &probe, &mut params, &pattern, Some(10), None)
-            .await
-            .map_err(|e| {
-                self.note(&e);
-                e
-            })?;
-        if params.encoder != first_name {
-            if params.encoder == "libx264" || params.encoder == "libx265" {
-                self.note("Hardware encoder unavailable. Using software encoding.");
-            } else {
-                self.note(&format!(
-                    "{first_label} unavailable. Using {}.",
-                    params.encoder_label
-                ));
-            }
-        } else if wanted_audio != "none" && params.audio == "none" {
-            self.note("Audio capture failed — replay video only.");
-        }
-        let Spawned { child, live } = spawned;
-        let stop_flag = Arc::new(AtomicBool::new(false));
         let duration = s.replay_duration.clamp(5, 600);
-        let supervisor = {
-            let flag = stop_flag.clone();
-            let dir = segdir.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    if flag.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    prune_segments(&dir, duration);
-                }
-            })
-        };
+        let targets = resolve_targets(&params.area, params.out_w, params.out_h)?;
+        let (segs, pump) = Self::start_seg_set(&params, &targets, &segdir, 0, None, &mut self.last_message)?;
         self.replay = Some(ActiveReplay {
-            child: Some(child),
+            segs,
+            pump,
+            closed: vec![],
             segdir,
             started_at: Instant::now(),
             duration_s: duration,
             params,
-            live,
-            stop_flag,
-            supervisor: Some(supervisor),
+            supervisor: Some(Self::spawn_rotator(shared.clone())),
+            watch_noted: false,
         });
         self.apply_tray(app);
         self.notify(
@@ -1796,21 +1668,199 @@ impl Recorder {
         Ok(status_of(self))
     }
 
+    /// Start one segment set across monitors + wire the shared audio pump.
+    /// `idx` numbers the files. `pump` is reused across rotations (gapless
+    /// audio) and only created when absent. Associated (not `&mut self`) so
+    /// rotation/supervisor code can run alongside a borrowed recorder.
+    fn start_seg_set(
+        params: &Params,
+        targets: &[NativeTarget],
+        segdir: &Path,
+        idx: usize,
+        pump: Option<crate::audio::PcmPump>,
+        note_sink: &mut String,
+    ) -> Result<(Vec<LiveSeg>, Option<crate::audio::PcmPump>), String> {
+        let mut segs = vec![];
+        for (i, t) in targets.iter().enumerate() {
+            let part = segdir.join(format!("seg{idx:05}_m{i}.mp4"));
+            let cfg = native_cfg(params, t);
+            match crate::nativerec::start_session(cfg, part.clone()) {
+                Ok(session) => segs.push(LiveSeg { session, path: part, monitor_idx: t.monitor_idx }),
+                Err(e) => {
+                    for s in segs.drain(..) {
+                        let _ = s.session.stop_and_join();
+                        let _ = std::fs::remove_file(&s.path);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let txs: Vec<_> = segs.iter().map(|sg| sg.session.audio_tx.clone()).collect();
+        let pump_opt = match pump {
+            Some(p) => {
+                p.retarget(txs);
+                Some(p)
+            }
+            None => {
+                let (pump, note) = crate::audio::start_pcm_pump(
+                    &params.audio,
+                    params.mic.as_deref().unwrap_or(""),
+                    params.sample_rate,
+                    params.channels,
+                    txs,
+                );
+                if let Some(n) = note {
+                    if note_sink.is_empty() {
+                        *note_sink = n;
+                    }
+                }
+                if pump.is_active() { Some(pump) } else { None }
+            }
+        };
+        Ok((segs, pump_opt))
+    }
+
+    /// Rotation supervisor: every SEG_SECS finishes the open set (blocking
+    /// finalize off-thread), seals it, opens a fresh set on the SAME pump
+    /// (audio never gaps), and prunes sets older than duration + margin.
+    /// Pure rolling buffer â€” nothing is ever a "final file" until save.
+    fn spawn_rotator(shared: Shared) -> tokio::task::JoinHandle<()> {
+        const SEG_SECS: u64 = 10;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(SEG_SECS)).await;
+                // Resolve FIRST while the old set keeps recording: a display
+                // change (#76) skips the tick with zero interruption.
+                let staged = {
+                    let mut rec = shared.lock().await;
+                    let Some(rp) = rec.replay.as_mut() else { break };
+                    let params = rp.params.clone();
+                    match resolve_targets(&params.area, params.out_w, params.out_h) {
+                        Ok(t) if !t.is_empty() => {
+                            let segs = std::mem::take(&mut rp.segs);
+                            let segdir = rp.segdir.clone();
+                            let idx = rp.closed.len() + 100;
+                            Some((params, segdir, idx, segs))
+                        }
+                        Ok(_) => {
+                            rec.note("Display configuration changed â€” replay retrying.");
+                            None
+                        }
+                        Err(e) => {
+                            rec.note(&format!("Display change ignored for replay ({e}). Retrying."));
+                            None
+                        }
+                    }
+                };
+                let Some((params, segdir, idx, segs)) = staged else { continue };
+                let finished: Vec<FinishedSeg> =
+                    tokio::task::spawn_blocking(move || finish_segs(segs))
+                        .await
+                        .unwrap_or_default();
+                let mut rec = shared.lock().await;
+                let Some(rp) = rec.replay.as_mut() else { break };
+                let mut files = vec![];
+                for f in finished {
+                    if valid_part(&f.path) {
+                        files.push((f.monitor_idx, f.path));
+                    } else {
+                        let _ = std::fs::remove_file(&f.path);
+                    }
+                }
+                if !files.is_empty() {
+                    rp.closed.push(SegSet { files, finished_at: std::time::SystemTime::now() });
+                }
+                // Fresh set on the live pump (audio gapless via retarget).
+                // Targets were resolved BEFORE the old set was touched, so a
+                // start failure here only affects this tick (old footage is
+                // already sealed in `closed`).
+                let targets = resolve_targets(&params.area, params.out_w, params.out_h)
+                    .unwrap_or_default();
+                let mut rec = shared.lock().await;
+                let Some(rp) = rec.replay.as_mut() else { break };
+                if targets.is_empty() {
+                    rec.note("Display configuration changed â€” replay retrying.");
+                    drop(rec);
+                    continue;
+                }
+                let pump = rp.pump.take();
+                // Release the guard before the blocking session starts
+                // (WGC init can take a moment; never hold the lock for it).
+                let mut last_message = std::mem::take(&mut rec.last_message);
+                drop(rec);
+                let started = Self::start_seg_set(&params, &targets, &segdir, idx, pump, &mut last_message);
+                let mut rec = shared.lock().await;
+                rec.last_message = last_message;
+                match started {
+                    Ok((segs, pump)) => match rec.replay.as_mut() {
+                        Some(rp) => {
+                            rp.segs = segs;
+                            rp.pump = pump;
+                        }
+                        None => {
+                            // Replay stopped mid-rotation: finalize + delete
+                            // orphans off-thread (never leak threads/files).
+                            drop(rec);
+                            tokio::task::spawn_blocking(move || {
+                                for s in segs {
+                                    let _ = s.session.stop_and_join();
+                                    let _ = std::fs::remove_file(&s.path);
+                                }
+                                if let Some(p) = pump {
+                                    p.stop_and_join();
+                                }
+                            })
+                            .await
+                            .ok();
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        rec.note(&format!("Replay rotation failed ({e}). Retrying."));
+                    }
+                }
+                // Prune sets fully older than duration + 25s margin.
+                let Some(rp) = rec.replay.as_mut() else { break };
+                let cutoff = std::time::SystemTime::now()
+                    .checked_sub(Duration::from_secs(rp.duration_s + 25))
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                rp.closed.retain(|s| {
+                    let keep = s.finished_at >= cutoff;
+                    if !keep {
+                        for (_, p) in &s.files {
+                            let _ = std::fs::remove_file(p);
+                        }
+                    }
+                    keep
+                });
+            }
+        })
+    }
+
     pub async fn replay_stop(&mut self, app: &tauri::AppHandle) -> Result<RecStatus, String> {
         let mut rp = self.replay.take().ok_or("Instant Replay is off.".to_string())?;
-        rp.stop_flag.store(true, Ordering::SeqCst);
         if let Some(h) = rp.supervisor.take() {
             h.abort();
         }
-        if let Some(mut child) = rp.child.take() {
-            quit_child(&mut child).await;
+        let segs = std::mem::take(&mut rp.segs);
+        let finished: Vec<FinishedSeg> =
+            tokio::task::spawn_blocking(move || finish_segs(segs))
+                .await
+                .map_err(|e| e.to_string())?;
+        for f in finished {
+            let _ = std::fs::remove_file(&f.path);
+        }
+        if let Some(pump) = rp.pump.take() {
+            pump.stop_and_join();
         }
         let _ = std::fs::remove_dir_all(&rp.segdir);
         self.apply_tray(app);
         Ok(status_of(self))
     }
 
-    /// Save the last N seconds as a final MP4. Buffer keeps rolling afterwards.
+    /// Save the last N seconds as final MP4(s). NO countdown: export is
+    /// strictly T-N..T. The buffer is rotated first and keeps rolling
+    /// throughout â€” saving never interrupts buffering.
     pub async fn replay_save(&mut self, app: &tauri::AppHandle) -> Result<RecStatus, String> {
         let ready_s = self
             .replay
@@ -1821,143 +1871,146 @@ impl Recorder {
             return Err("Instant Replay is off. Enable it first.".to_string());
         }
         if ready_s < 3 {
-            return Err("Instant Replay is not ready yet. Please wait a few seconds. / انتظر بضع ثوانٍ حتى يجهز.".to_string());
+            return Err("Instant Replay is not ready yet. Please wait a few seconds. / Ø§Ù†ØªØ¸Ø± Ø¨Ø¶Ø¹ Ø«ÙˆØ§Ù†Ù Ø­ØªÙ‰ ÙŠØ¬Ù‡Ø².".to_string());
         }
-        // Pause the rolling buffer while finalizing, then resume it.
-        let mut rp = self.replay.take().unwrap();
-        rp.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(h) = rp.supervisor.take() {
-            h.abort();
-        }
-        if let Some(mut child) = rp.child.take() {
-            quit_child(&mut child).await;
-        }
-        let result = self.finalize_replay(app, &rp).await;
-        // Resume buffering with a fresh segmenter (rolling continues).
-        let resume = self.restart_replay_child(app, &rp.params, rp.duration_s).await;
-        match (result, resume) {
-            (Ok(_), Ok(_)) => {}
-            (Err(e), _) => {
-                // Buffer is already restarted if resume ok; surface save error.
+        self.replay_saving = true;
+        self.apply_tray(app);
+        // Rotate-then-merge (buffer never stops; no countdown on save).
+        let segdir = self
+            .replay
+            .as_ref()
+            .map(|rp| rp.segdir.clone())
+            .unwrap_or_else(|| std::env::temp_dir().join("openscreen-replay"));
+        let duration_s = self.replay.as_ref().map(|rp| rp.duration_s).unwrap_or(30);
+        let result = self.replay_rotate_and_save(app, &segdir, duration_s).await;
+        self.replay_saving = false;
+        match result {
+            Ok(_) => {}
+            Err(e) => {
                 self.note(&e);
                 self.apply_tray(app);
                 return Err(e);
-            }
-            (_, Err(e)) => {
-                self.note(&format!("Replay saved, but buffer restart failed: {e}"));
             }
         }
         self.apply_tray(app);
         Ok(status_of(self))
     }
 
-    async fn restart_replay_child(
+    /// Rotate-then-merge for replay save. Returns after fresh segments are
+    /// live again; the merged file(s) are already in the recording folder.
+    async fn replay_rotate_and_save(
         &mut self,
         app: &tauri::AppHandle,
-        params: &Params,
-        duration: u64,
+        segdir: &Path,
+        duration_s: u64,
     ) -> Result<(), String> {
-        let ff = ffmpeg_path().ok_or("Recorder engine missing.".to_string())?;
-        let segdir = std::env::temp_dir().join("openscreen-replay");
-        let _ = std::fs::remove_dir_all(&segdir);
-        std::fs::create_dir_all(&segdir).map_err(|e| e.to_string())?;
-        let pattern = segdir.join("seg%05d.mp4");
-        let mut params = params.clone();
-        let probe = get_probe(false)?;
-        let spawned = spawn_verified(&ff, &probe, &mut params, &pattern, Some(10), None)
-            .await
-            .map_err(|e| {
-                self.note(&e);
-                e
-            })?;
-        let Spawned { child, live } = spawned;
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let supervisor = {
-            let flag = stop_flag.clone();
-            let dir = segdir.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    if flag.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    prune_segments(&dir, duration);
-                }
-            })
+        // Finish open set off-thread.
+        let (segs, params) = {
+            let rp = self.replay.as_mut().ok_or("Instant Replay is off.".to_string())?;
+            (std::mem::take(&mut rp.segs), rp.params.clone())
         };
-        self.replay = Some(ActiveReplay {
-            child: Some(child),
-            segdir,
-            started_at: Instant::now(),
-            duration_s: duration,
-            params: params.clone(),
-            live,
-            stop_flag,
-            supervisor: Some(supervisor),
-        });
-        let _ = app;
-        Ok(())
-    }
-
-    async fn finalize_replay(
-        &mut self,
-        app: &tauri::AppHandle,
-        rp: &ActiveReplay,
-    ) -> Result<PathBuf, String> {
-        let cutoff = std::time::SystemTime::now()
-            - Duration::from_secs(rp.duration_s + 12); // segment granularity margin
-        let mut segs: Vec<(PathBuf, std::time::SystemTime)> = vec![];
-        if let Ok(rd) = std::fs::read_dir(&rp.segdir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.extension().and_then(|x| x.to_str()) != Some("mp4") {
-                    continue;
+        let finished: Vec<FinishedSeg> =
+            tokio::task::spawn_blocking(move || finish_segs(segs))
+                .await
+                .map_err(|e| e.to_string())?;
+        // Reopen immediately (rolling continues during the merge below).
+        {
+            let rp = self.replay.as_mut().ok_or("Instant Replay is off.".to_string())?;
+            let pump = rp.pump.take();
+            let targets = resolve_targets(&params.area, params.out_w, params.out_h)
+                .map_err(|e| format!("Display changed during save: {e}"))?;
+            let idx = rp.closed.len() + 2000;
+            let mut sink = std::mem::take(&mut self.last_message);
+            match Self::start_seg_set(&params, &targets, segdir, idx, pump, &mut sink) {
+                Ok((segs, pump)) => {
+                    rp.segs = segs;
+                    rp.pump = pump;
                 }
-                let mt = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                if mt >= cutoff {
-                    segs.push((p, mt));
+                Err(e) => {
+                    // Buffer degraded but the sealed tail is still mergeable.
+                    sink = format!("Replay buffer restart failed ({e}); merging sealed part.");
+                }
+            }
+            if self.last_message.is_empty() {
+                self.last_message = sink;
+            }
+        }
+        // Seal the just-finished set into the window.
+        let mut fresh: Vec<(usize, PathBuf)> = vec![];
+        for f in finished {
+            if valid_part(&f.path) {
+                fresh.push((f.monitor_idx, f.path));
+            }
+        }
+        {
+            let rp = self.replay.as_mut().ok_or("Instant Replay is off.".to_string())?;
+            if !fresh.is_empty() {
+                rp.closed.push(SegSet { files: fresh, finished_at: std::time::SystemTime::now() });
+            }
+        }
+        // 2) Merge per monitor over the closed window, trimmed to duration.
+        let (closed, post_action) = {
+            let rp = self.replay.as_ref().ok_or("Instant Replay is off.".to_string())?;
+            (rp.closed.clone(), settings::load_settings().replay_post_action.clone())
+        };
+        let mut per_mon: std::collections::BTreeMap<usize, Vec<PathBuf>> = Default::default();
+        for set in &closed {
+            for (mi, p) in &set.files {
+                if p.exists() {
+                    per_mon.entry(*mi).or_default().push(p.clone());
                 }
             }
         }
-        segs.sort_by(|a, b| a.0.cmp(&b.0));
-        let files: Vec<PathBuf> = segs.into_iter().map(|(p, _)| p).collect();
-        if files.is_empty() {
+        if per_mon.is_empty() {
             return Err("Instant Replay is not ready yet. Please wait a few seconds.".to_string());
         }
         let s = settings::load_settings();
         let folder = default_folder(&s);
         let _ = std::fs::create_dir_all(&folder);
-        let est: u64 = files
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-            .sum();
-        check_disk(&folder, est + 100 * 1024 * 1024)?;
-        let out = folder.join(final_name(true));
-        let ff = ffmpeg_path().ok_or("Recorder engine missing.".to_string())?;
-        concat_copy(&ff, &files, &out).await?;
-        let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
-        let item = RecHistoryItem {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: out
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("replay.mp4")
-                .to_string(),
-            path: out.to_string_lossy().to_string(),
-            created_at: chrono::Local::now().to_rfc3339(),
-            duration_s: rp.duration_s.min(
-                rp.started_at.elapsed().as_secs(),
-            ),
-            width: rp.params.out_w,
-            height: rp.params.out_h,
-            fps: rp.params.fps,
-            size,
-            kind: "replay".to_string(),
-        };
-        rec_history_add(item, s.rec_history_limit);
-        self.notify(app, "Instant Replay saved", &out.to_string_lossy());
-        apply_post_action(app, &s.replay_post_action, &out);
-        Ok(out)
+        let multi = per_mon.len() > 1;
+        let base = final_name(true);
+        let mut first_out = String::new();
+        for (mi, files) in &per_mon {
+            let name = if multi {
+                format!("{}_S{}.mp4", base.trim_end_matches(".mp4"), mi + 1)
+            } else {
+                base.clone()
+            };
+            let out = folder.join(&name);
+            crate::mp4mux::remux_segments_keep_last(files, &out, duration_s as f64).map_err(|e| {
+                format!("Replay merge failed: {e}")
+            })?;
+            if first_out.is_empty() {
+                first_out = out.to_string_lossy().to_string();
+            }
+            let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+            let (hist_w, hist_h, hist_fps) = match crate::mp4info::read_info(&out) {
+                Ok(info) => (
+                    info.video.as_ref().map(|v| v.width).unwrap_or(params.out_w),
+                    info.video.as_ref().map(|v| v.height).unwrap_or(params.out_h),
+                    crate::mp4info::container_fps(&info).round() as u32,
+                ),
+                Err(_) => (params.out_w, params.out_h, params.fps),
+            };
+            rec_history_add(
+                RecHistoryItem {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: name.clone(),
+                    path: out.to_string_lossy().to_string(),
+                    created_at: chrono::Local::now().to_rfc3339(),
+                    duration_s,
+                    width: hist_w,
+                    height: hist_h,
+                    fps: hist_fps,
+                    size,
+                    kind: "replay".to_string(),
+                },
+                s.rec_history_limit,
+            );
+        }
+        self.notify(app, "Instant Replay saved", &first_out);
+        apply_post_action(app, &post_action, Path::new(&first_out));
+        Ok(())
     }
 
     // ------------------------------------------------------------ helpers --
@@ -1991,6 +2044,7 @@ impl Recorder {
 }
 
 /// Tray tooltip text for the current state (timer ticks + instant refreshes).
+/// Minimal live status: REC + time + res/fps + audio (no heavy UI).
 fn tooltip_text(rec: &Recorder) -> String {
     if let Some(r) = &rec.rec {
         let mut ms = r.active_ms;
@@ -1998,14 +2052,24 @@ fn tooltip_text(rec: &Recorder) -> String {
             ms += t.elapsed().as_millis() as u64;
         }
         let s = ms / 1000;
-        if r.child.is_some() {
+        let res = format!("{}p", r.params.out_h);
+        let audio = match r.params.audio.as_str() {
+            "both" => "System+Mic",
+            "system" => "System",
+            "mic" | "microphone" => "Mic",
+            _ => "Muted",
+        };
+        if !r.segs.is_empty() {
             format!(
-                "● Recording {:02}:{:02} — Ctrl+Shift+R to stop",
+                "â— REC {:02}:{:02} Â· {} {} FPS Â· {} â€” Ctrl+Shift+R to stop",
                 s / 60,
-                s % 60
+                s % 60,
+                res,
+                r.params.fps,
+                audio
             )
         } else {
-            format!("❚❚ Paused {:02}:{:02}", s / 60, s % 60)
+            format!("âšâš Paused {:02}:{:02} Â· {} {} FPS", s / 60, s % 60, res, r.params.fps)
         }
     } else if let Some(rp) = &rec.replay {
         format!(
@@ -2039,26 +2103,6 @@ fn make_rec_dot() -> (Vec<u8>, u32, u32) {
         }
     }
     (img.into_raw(), w, h)
-}
-
-fn prune_segments(dir: &Path, duration_s: u64) {
-    let cutoff =
-        std::time::SystemTime::now() - Duration::from_secs(duration_s + 25); // keep margin
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("mp4") {
-                continue;
-            }
-            if let Ok(m) = e.metadata() {
-                if let Ok(mt) = m.modified() {
-                    if mt < cutoff {
-                        let _ = std::fs::remove_file(&p);
-                    }
-                }
-            }
-        }
-    }
 }
 
 fn full_virtual_area() -> Area {
@@ -2141,6 +2185,68 @@ pub fn default_source_area(s: &AppSettings) -> Area {
                 None => norm(full_virtual_area()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn replay_ring_rotate_and_save_window() {
+        let _capture_guard = crate::wgc::CAPTURE_LOCK.lock().unwrap();
+        // Exercises the exact primitives replay save uses (segment sets +
+        // keep-last merge) without needing a Tauri AppHandle.
+        let dir = std::env::temp_dir().join(format!("openscreen-ringtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = crate::settings::load_settings();
+        let probe = get_probe(false).expect("native probe failed");
+        let area = full_virtual_area();
+        let params = resolve_params(&s, &probe, area, true).expect("params failed");
+        let targets = resolve_targets(&params.area, params.out_w, params.out_h).expect("targets failed");
+        assert_eq!(targets.len(), 1, "expected single monitor here");
+        let wiggler = std::thread::spawn(|| crate::wgc::wiggle_cursor(10));
+        let mut last_message = String::new();
+        // Two rotations â‰ˆ two closed sets; the SAME pump is retargeted
+        // (gapless audio across the joint, like the real supervisor).
+        let (segs, pump) =
+            Recorder::start_seg_set(&params, &targets, &dir, 1, None, &mut last_message).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let f1 = finish_segs(segs);
+        let (segs, pump) =
+            Recorder::start_seg_set(&params, &targets, &dir, 2, pump, &mut last_message).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let f2 = finish_segs(segs);
+        if let Some(p) = pump {
+            p.stop_and_join();
+        }
+        let _ = wiggler.join();
+        let sets = vec![
+            SegSet {
+                files: f1.into_iter().filter(|f| valid_part(&f.path)).map(|f| (f.monitor_idx, f.path)).collect(),
+                finished_at: std::time::SystemTime::now(),
+            },
+            SegSet {
+                files: f2.into_iter().filter(|f| valid_part(&f.path)).map(|f| (f.monitor_idx, f.path)).collect(),
+                finished_at: std::time::SystemTime::now(),
+            },
+        ];
+        assert!(sets.iter().all(|s| !s.files.is_empty()), "empty segment set");
+        let mut per_mon: std::collections::BTreeMap<usize, Vec<PathBuf>> = Default::default();
+        for set in &sets {
+            for (mi, p) in &set.files {
+                per_mon.entry(*mi).or_default().push(p.clone());
+            }
+        }
+        let out = dir.join("replay.mp4");
+        let info = crate::mp4mux::remux_segments_keep_last(&per_mon[&0], &out, 3.0).expect("ring merge failed");
+        eprintln!("ring save: {info:?}");
+        assert!(info.duration_sec >= 2.0 && info.duration_sec <= 4.5, "bad window: {}", info.duration_sec);
+        let back = crate::mp4info::read_info(&out).expect("ring file unreadable");
+        assert!(back.video.is_some());
+        // Cleanup temp.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

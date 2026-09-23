@@ -8,7 +8,7 @@ Lightweight, local-first Windows desktop app built with **Rust + Tauri** (no Ele
 - System tray (Take Screenshot / OCR / History / Settings / Quit), no always-open window
 - Global hotkeys: `Ctrl+Shift+S` screenshot, `Ctrl+Shift+O` OCR (both remappable)
 - Capture mode pill (top-center): Screenshot / Text / **Record** — `Tab` cycles, one shortcut for all
-- Screen recording (ffmpeg, local, lazy one-time download): area/fullscreen/monitor/all-screens/window, pause/resume (lossless concat), MP4 H.264, hardware encoding first (NVENC/QuickSync/AMF → software fallback with notice), mic/system/mixed audio, cursor toggle
+- Screen recording (fully native: Windows Graphics Capture + Media Foundation + WASAPI, no downloads): area/fullscreen/monitor/all-screens/window, pause/resume (lossless stream-copy merge), MP4 H.264/HEVC, hardware encoding first (Media Foundation HW MFT → inbox software fallback with notice), mic/system/mixed audio, cursor toggle
 - Instant Replay: rolling temp buffer (10–300s + custom), `Ctrl+Shift+I` saves last N seconds as `OpenScreen_Replay_*.mp4`, buffer keeps rolling after save
 - Overlay selection: Region (+ live `W × H`), Fullscreen (`F`), Active window (`W`), All screens (`A`), multi-monitor aware, Esc cancels
 - After capture YOU choose: Copy / Save / Copy+Save / Edit / OCR / Share / Open / Delete
@@ -22,14 +22,13 @@ Lightweight, local-first Windows desktop app built with **Rust + Tauri** (no Ele
 - Rust stable (MSVC) + Node 18+
 - For release builds: Visual Studio Build Tools (C++ workload)
 
-## Bundled engines (install-time, offline)
-The installer ships everything — no runtime downloads needed:
-- `src-tauri/resources/ffmpeg/ffmpeg.exe` (screen recording, HW encoders included)
+## Native recording (no downloads)
+Recording, replay and audio run on Windows itself (Graphics Capture + Media
+Foundation + WASAPI) — no recorder downloads, no bundled recorder binaries.
+Only OCR data ships with the installer:
 - `src-tauri/resources/tesseract/` (Tesseract + `tessdata/eng` + `tessdata/ara`)
-- Runtime downloads (winget / GitHub) remain only as a fallback if a custom
-  build is made without `resources/`.
-- Note: the installer is large (~100MB+) because the engines travel with it.
-  ffmpeg is GPL (used as a separate process, not linked).
+- Tesseract runtime fallback remains via winget if a custom build ships
+  without `resources/`.
 
 ## Dev
 ```powershell
